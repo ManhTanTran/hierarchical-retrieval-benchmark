@@ -1,0 +1,33 @@
+project_name: dapr-hhr-phase1
+seed: 42
+
+data:
+  hf_repo: UKPLab/dapr
+  dataset_name: ConditionalQA
+  split: test
+  query_limit: 25
+  corpus_limit: 5000
+  preserve_gold: true
+
+retrieval:
+  document_top_k: 20
+  passage_top_k: 100
+  fusion: rrf
+  rrf_k: 60
+  dense_model: intfloat/e5-small-v2
+  dense_batch_size: 64
+  dense_query_prefix: "query: "
+  dense_corpus_prefix: "passage: "
+
+evaluation:
+  ndcg_k: 10
+  recall_k: 100
+
+run:
+  mode: smoke
+  smoke_experiments:
+    - sparse__sparse
+    - sparse__dense
+    - dense__dense
+    - combined__combined
+
