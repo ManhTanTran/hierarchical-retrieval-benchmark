@@ -19,6 +19,7 @@ baseline used in HHR-style experiments.
 - Passage nDCG@10 / Recall@100 and document nDCG / Recall.
 - Per-query results, latency, NQ-hard category analysis, run metadata, and exportable artifacts.
 - A Kaggle notebook whose cells only orchestrate reusable code from `src/dapr_hhr`.
+- A single high-level `run_phase1_benchmark(...)` API; Kaggle owns no benchmark logic.
 - Unit tests and a synthetic end-to-end smoke check.
 
 No benchmark scores are committed. Run the notebook to produce them from the selected data and
@@ -39,6 +40,7 @@ hierarchical-retrieval-benchmark/
 │   ├── pipeline.py             # document → candidate passages
 │   ├── metrics.py              # document/passage metrics and groups
 │   ├── experiments.py          # nine-run registry and runner
+│   ├── workflow.py             # complete Phase 1 public API for notebooks
 │   └── artifacts.py            # metrics, rankings, environment metadata
 └── tests/
 ```
@@ -53,10 +55,28 @@ hierarchical-retrieval-benchmark/
    `/kaggle/working/dapr_hhr_cache`.
 5. Download `dapr_hhr_outputs.zip` from the Kaggle Output panel.
 
-The bootstrap cell clones the pinned GitHub branch into `/kaggle/working`; DAPR is read through the
-official Hugging Face dataset API. Internet is therefore required for the first run. To run with
-Internet disabled later, save the Hugging Face/model cache as a private Kaggle Dataset and point the
-cache environment variables to that input.
+The bootstrap cell installs the package directly from the selected GitHub branch or commit. The
+notebook then calls only this public function:
+
+```python
+from dapr_hhr import run_phase1_benchmark
+
+report = run_phase1_benchmark(
+    dataset_name="ConditionalQA",
+    run_mode="smoke",
+    fusion="rrf",
+)
+report.leaderboard
+```
+
+If a reusable function has a bug, fix it under `src/dapr_hhr`, add a regression test, and push the
+commit. Restart the Kaggle session and rerun the installation cell; the notebook itself does not
+need to be copied or edited. Keep `REPO_REF="main"` while developing, then use a commit SHA for final
+reproducible runs.
+
+DAPR is read through the official Hugging Face dataset API. Internet is required for the first run.
+To run with Internet disabled later, save the Hugging Face/model cache as a private Kaggle Dataset
+and point the cache environment variables to that input.
 
 ## Local verification
 
@@ -101,4 +121,3 @@ measure the incremental gain with the same artifact and metric functions.
 - [DAPR dataset](https://huggingface.co/datasets/UKPLab/dapr)
 - [DAPR paper](https://aclanthology.org/2024.acl-long.236/)
 - [HHR paper](https://aclanthology.org/2023.findings-acl.679/)
-

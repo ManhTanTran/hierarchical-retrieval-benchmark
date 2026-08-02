@@ -7,6 +7,7 @@ import platform
 import subprocess
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any
 
@@ -52,10 +53,15 @@ def collect_environment() -> dict[str, Any]:
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         git_commit = None
+    try:
+        direct_url_text = distribution("dapr-hhr").read_text("direct_url.json")
+        package_source = json.loads(direct_url_text) if direct_url_text else None
+    except (PackageNotFoundError, json.JSONDecodeError):
+        package_source = None
     return {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "git_commit": git_commit,
+        "package_source": package_source,
     }
-
