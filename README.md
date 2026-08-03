@@ -21,9 +21,10 @@ DAPR-specific work:
 - enforce the MS MARCO zero-shot protocol;
 - map NQ-hard labels to CR, MT, MHR, and AC.
 
-Reusable code under `src/dapr_hhr` starts with a validated `DatasetBundle` and
-owns retrieval, fusion, metrics, the experiment matrix, caching, and artifacts.
-Another dataset can construct the same bundle without importing DAPR code.
+Reusable code under `src/dapr_hhr` owns retrieval, fusion, metrics, the
+experiment matrix, caching, and artifacts. Small datasets can use an in-memory
+`DatasetBundle`; large datasets can stream normalized records into a
+`DiskDatasetStore`. Neither path imports DAPR-specific code.
 
 ## Layout
 
@@ -33,6 +34,7 @@ hierarchical-retrieval-benchmark/
 ├── scripts/run_synthetic_smoke.py
 ├── src/dapr_hhr/
 │   ├── data.py
+│   ├── scalable.py
 │   ├── config.py
 │   ├── retrieval/
 │   ├── fusion.py
@@ -58,6 +60,13 @@ The local notebook's install cell uses this repository only for reusable Python
 code. Keep `REPO_REF="main"` while developing; use a tested commit SHA for a
 reported experiment.
 
+Real DAPR modes use the scalable path: Hugging Face rows stream into SQLite,
+FTS5 supplies the persistent sparse index, and sentence-transformer embeddings
+are generated in batches into memory-mapped `.npy` files. Indexes are built once
+per retrieval level and reused by the selected experiment matrix. Temporary
+stores and indexes belong under `/kaggle/tmp`; only final artifacts belong under
+`/kaggle/working`.
+
 ## Reusable API
 
 ```python
@@ -72,6 +81,26 @@ report = run_phase1_benchmark(
 print(report.leaderboard)
 ```
 
+For a large normalized corpus:
+
+```python
+from dapr_hhr import DiskDatasetStore, run_scalable_phase1_benchmark
+
+store = DiskDatasetStore.create("dataset.sqlite", name="my_dataset")
+store.add_documents(document_iterator)
+store.add_passages(passage_iterator)
+store.add_queries(query_iterator)
+store.add_qrels(qrel_iterator)
+store.finalize()
+
+report = run_scalable_phase1_benchmark(
+    store,
+    run_mode="full",
+    index_dir="indexes",
+    output_dir="outputs",
+)
+```
+
 ## Local verification
 
 ```powershell
@@ -79,6 +108,7 @@ python -m pip install -e ".[dev]"
 python -m pytest
 python -m ruff check .
 python scripts/run_synthetic_smoke.py
+python scripts/run_scalable_smoke.py
 ```
 
 ## Protocol and scale boundary
@@ -87,8 +117,15 @@ python scripts/run_synthetic_smoke.py
 - Treat NQ-hard as diagnostic-only.
 - Preserve graded Genomics relevance for nDCG.
 - Report both passage and document metrics.
-- Full MIRACL and Genomics require a sharded/indexed backend beyond the included
-  exact in-memory sentence-transformer implementation.
+- Query sampling reduces evaluation work but does not reduce corpus ingestion or
+  index construction.
+- The scalable dense backend uses exact cosine search over a memory-mapped
+  matrix; FTS5 provides the disk-backed sparse ranking. Results produced by the
+  old in-memory BM25 path are not directly comparable, so rerun every dataset
+  used in one comparison with the same backend.
+- Very large MIRACL and Genomics builds can still exceed Kaggle's temporary-disk
+  or session-time limits. The backend prevents full-corpus RAM materialization;
+  it does not make storage or encoding cost disappear.
 
 No notebooks, benchmark scores, datasets, embeddings, model weights, or
 credentials are committed.
