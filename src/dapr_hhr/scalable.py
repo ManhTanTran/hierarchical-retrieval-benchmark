@@ -490,6 +490,19 @@ class MemmapDenseIndex:
             self.encoder = SentenceTransformer(self.model_name, revision=self.model_revision)
         return self.encoder
 
+    @staticmethod
+    def _embedding_dimension(encoder: Any) -> int:
+        current = getattr(encoder, "get_embedding_dimension", None)
+        if callable(current):
+            return int(current())
+        legacy = getattr(encoder, "get_sentence_embedding_dimension", None)
+        if callable(legacy):
+            return int(legacy())
+        raise TypeError(
+            "Dense encoder must provide get_embedding_dimension() or "
+            "get_sentence_embedding_dimension()."
+        )
+
     def _expected_metadata(self, dimensions: int) -> dict[str, Any]:
         return {
             "dataset_id": self.store.dataset_id,
@@ -505,7 +518,7 @@ class MemmapDenseIndex:
 
     def build(self) -> MemmapDenseIndex:
         encoder = self._get_encoder()
-        dimensions = int(encoder.get_sentence_embedding_dimension())
+        dimensions = self._embedding_dimension(encoder)
         expected = self._expected_metadata(dimensions)
         if self.metadata_path.is_file() and self.embedding_path.is_file():
             current = json.loads(self.metadata_path.read_text(encoding="utf-8"))

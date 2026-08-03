@@ -22,7 +22,7 @@ from dapr_hhr import (  # noqa: E402
 
 
 class KeywordEncoder:
-    def get_sentence_embedding_dimension(self) -> int:
+    def get_embedding_dimension(self) -> int:
         return 2
 
     def encode(self, texts, **_kwargs):

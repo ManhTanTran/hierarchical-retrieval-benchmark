@@ -8,7 +8,7 @@ from dapr_hhr.scalable import MemmapDenseIndex, run_scalable_phase1_benchmark
 
 
 class FakeEncoder:
-    def get_sentence_embedding_dimension(self):
+    def get_embedding_dimension(self):
         return 2
 
     def encode(self, texts, **kwargs):
@@ -19,6 +19,13 @@ class FakeEncoder:
         matrix = np.asarray(rows, dtype=np.float32)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         return matrix / np.where(norms == 0, 1.0, norms)
+
+
+class LegacyEncoder(FakeEncoder):
+    get_embedding_dimension = None
+
+    def get_sentence_embedding_dimension(self):
+        return 2
 
 
 def test_memmap_dense_index_builds_in_batches_and_searches_candidates(tmp_path):
@@ -54,6 +61,18 @@ def test_memmap_dense_index_reuses_completed_index(tmp_path):
 
     assert second.embedding_path.stat().st_mtime_ns == original_mtime
     assert [row.item_id for row in second.search("banana", 1)] == ["d2"]
+
+
+def test_memmap_dense_index_supports_legacy_dimension_api(tmp_path):
+    store = make_store(tmp_path)
+    index = MemmapDenseIndex(
+        store,
+        "document",
+        tmp_path / "dense",
+        encoder=LegacyEncoder(),
+    ).build()
+
+    assert index.embedding_path.is_file()
 
 
 def test_memmap_dense_index_searches_many_without_loading_matrix(tmp_path):
