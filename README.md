@@ -11,7 +11,9 @@ passage-retriever combinations:
 
 ## Responsibility boundary
 
-The Kaggle notebook owns DAPR-specific work:
+The Kaggle notebook is maintained locally and uploaded directly to Kaggle. It
+is intentionally not committed to this repository. That notebook owns
+DAPR-specific work:
 
 - download from the pinned `UKPLab/dapr` Hugging Face revision;
 - normalize official docs, corpus, query, qrel, and NQ-hard schemas;
@@ -28,7 +30,6 @@ Another dataset can construct the same bundle without importing DAPR code.
 ```text
 hierarchical-retrieval-benchmark/
 ├── configs/phase1.yaml
-├── notebooks/01_phase1_hhr_on_dapr.ipynb
 ├── scripts/run_synthetic_smoke.py
 ├── src/dapr_hhr/
 │   ├── data.py
@@ -45,7 +46,7 @@ hierarchical-retrieval-benchmark/
 
 ## Kaggle
 
-1. Upload or import `notebooks/01_phase1_hhr_on_dapr.ipynb`.
+1. Upload the locally maintained notebook directly to Kaggle.
 2. Enable Internet. A GPU is only needed for real sentence-transformer runs.
 3. Run all cells unchanged in `smoke` mode first. It uses a deterministic local
    bundle and hashing backend, so its scores are not DAPR results.
@@ -53,8 +54,9 @@ hierarchical-retrieval-benchmark/
    `datasets` with one dataset, and optionally set `query_sample_size`.
 5. Download the ZIP paths printed in the final cell from Kaggle Output.
 
-The install cell uses this repository. Keep `REPO_REF="main"` while developing;
-use a tested commit SHA for a reported experiment.
+The local notebook's install cell uses this repository only for reusable Python
+code. Keep `REPO_REF="main"` while developing; use a tested commit SHA for a
+reported experiment.
 
 ## Reusable API
 
@@ -88,8 +90,8 @@ python scripts/run_synthetic_smoke.py
 - Full MIRACL and Genomics require a sharded/indexed backend beyond the included
   exact in-memory sentence-transformer implementation.
 
-No benchmark scores, datasets, embeddings, model weights, or credentials are
-committed.
+No notebooks, benchmark scores, datasets, embeddings, model weights, or
+credentials are committed.
 
 ## Sources
 

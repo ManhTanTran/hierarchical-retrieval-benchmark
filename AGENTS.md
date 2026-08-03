@@ -1,7 +1,8 @@
 # Repository guidance
 
-- Keep dataset-specific DAPR download, official-schema normalization, sampling,
-  and diagnostic label mapping in the Kaggle notebook.
+- Keep every Jupyter/Kaggle notebook local; never commit `*.ipynb` files.
+- The local notebook owns dataset-specific DAPR download, official-schema
+  normalization, sampling, and diagnostic label mapping.
 - Put reusable dataset contracts, retrieval, fusion, evaluation, experiment, and
   artifact logic under `src/dapr_hhr`.
 - Keep the reusable workflow dependent only on a validated `DatasetBundle`.

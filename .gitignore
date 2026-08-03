@@ -22,6 +22,8 @@ venv/
 .env.*
 !.env.example
 .ipynb_checkpoints/
+# Kaggle notebooks are maintained locally and uploaded directly to Kaggle.
+*.ipynb
 *.npy
 *.npz
 *.faiss
