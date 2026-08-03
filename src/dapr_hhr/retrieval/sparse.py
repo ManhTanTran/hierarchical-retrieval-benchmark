@@ -32,9 +32,7 @@ class BM25Retriever(BaseRetriever):
         idf = np.log1p((len(self.item_ids) - df + 0.5) / (df + 0.5))
 
         row_ids = np.repeat(np.arange(counts.shape[0]), np.diff(counts.indptr))
-        denominator = counts.data + self.k1 * (
-            1 - self.b + self.b * doc_len[row_ids] / avg_len
-        )
+        denominator = counts.data + self.k1 * (1 - self.b + self.b * doc_len[row_ids] / avg_len)
         weights = counts.data * (self.k1 + 1) / denominator
         weights *= idf[counts.indices]
         self.matrix = sparse.csr_matrix(

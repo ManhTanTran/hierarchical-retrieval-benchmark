@@ -94,4 +94,3 @@ def run_hhr_pipeline(
         passage_top_k=passage_top_k,
     ).fit(bundle)
     return pipeline.run(bundle.queries)
-

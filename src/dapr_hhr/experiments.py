@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,7 +12,12 @@ from .config import BenchmarkConfig
 from .data import DatasetBundle
 from .metrics import evaluate_runs
 from .pipeline import HHRPipeline
-from .retrieval import BM25Retriever, CombinedRetriever, SentenceTransformerRetriever
+from .retrieval import (
+    BM25Retriever,
+    CombinedRetriever,
+    HashingRetriever,
+    SentenceTransformerRetriever,
+)
 from .retrieval.base import BaseRetriever
 
 METHODS = ("sparse", "dense", "combined")
@@ -40,17 +46,30 @@ def build_retriever(
     method: str,
     config: BenchmarkConfig,
     cache_path: str | Path | None = None,
-    dense_factory: Callable[..., BaseRetriever] = SentenceTransformerRetriever,
+    dense_factory: Callable[..., BaseRetriever] | None = None,
 ) -> BaseRetriever:
     if method == "sparse":
         return BM25Retriever()
-    dense = dense_factory(
-        model_name=config.retrieval.dense_model,
-        batch_size=config.retrieval.dense_batch_size,
-        query_prefix=config.retrieval.dense_query_prefix,
-        corpus_prefix=config.retrieval.dense_corpus_prefix,
-        cache_path=cache_path,
-    )
+    if dense_factory is not None:
+        dense = dense_factory(
+            model_name=config.retrieval.dense_model,
+            model_revision=config.retrieval.dense_model_revision,
+            batch_size=config.retrieval.dense_batch_size,
+            query_prefix=config.retrieval.dense_query_prefix,
+            corpus_prefix=config.retrieval.dense_corpus_prefix,
+            cache_path=cache_path,
+        )
+    elif config.retrieval.dense_backend == "hashing":
+        dense = HashingRetriever(dimensions=config.retrieval.hashing_features)
+    else:
+        dense = SentenceTransformerRetriever(
+            model_name=config.retrieval.dense_model,
+            model_revision=config.retrieval.dense_model_revision,
+            batch_size=config.retrieval.dense_batch_size,
+            query_prefix=config.retrieval.dense_query_prefix,
+            corpus_prefix=config.retrieval.dense_corpus_prefix,
+            cache_path=cache_path,
+        )
     if method == "dense":
         return dense
     if method == "combined":
@@ -68,23 +87,26 @@ def run_hhr_experiment(
     bundle: DatasetBundle,
     config: BenchmarkConfig,
     cache_dir: str | Path | None = None,
-    dense_factory: Callable[..., BaseRetriever] = SentenceTransformerRetriever,
+    dense_factory: Callable[..., BaseRetriever] | None = None,
 ) -> dict:
     cache_dir = Path(cache_dir) if cache_dir else None
-    fingerprint_hash = hashlib.sha1(config.retrieval.dense_model.encode("utf-8"))
+    fingerprint_hash = hashlib.sha256(
+        json.dumps(asdict(config.retrieval), sort_keys=True).encode("utf-8")
+    )
     for document in bundle.documents:
         fingerprint_hash.update(b"\0d\0")
         fingerprint_hash.update(document.doc_id.encode("utf-8"))
+        fingerprint_hash.update(document.title.encode("utf-8"))
+        fingerprint_hash.update(document.text.encode("utf-8"))
     for passage in bundle.passages:
         fingerprint_hash.update(b"\0p\0")
         fingerprint_hash.update(passage.passage_id.encode("utf-8"))
+        fingerprint_hash.update(passage.doc_id.encode("utf-8"))
+        fingerprint_hash.update(passage.title.encode("utf-8"))
+        fingerprint_hash.update(passage.text.encode("utf-8"))
     fingerprint = fingerprint_hash.hexdigest()[:12]
-    document_cache = (
-        cache_dir / f"{bundle.name}_{fingerprint}_documents.npy" if cache_dir else None
-    )
-    passage_cache = (
-        cache_dir / f"{bundle.name}_{fingerprint}_passages.npy" if cache_dir else None
-    )
+    document_cache = cache_dir / f"{bundle.name}_{fingerprint}_documents.npy" if cache_dir else None
+    passage_cache = cache_dir / f"{bundle.name}_{fingerprint}_passages.npy" if cache_dir else None
     document_retriever = build_retriever(
         experiment.document_method,
         config,

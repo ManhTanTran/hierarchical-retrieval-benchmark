@@ -14,6 +14,7 @@ class SentenceTransformerRetriever(BaseRetriever):
     def __init__(
         self,
         model_name: str = "intfloat/e5-small-v2",
+        model_revision: str | None = None,
         batch_size: int = 64,
         query_prefix: str = "query: ",
         corpus_prefix: str = "passage: ",
@@ -21,6 +22,7 @@ class SentenceTransformerRetriever(BaseRetriever):
         device: str | None = None,
     ) -> None:
         self.model_name = model_name
+        self.model_revision = model_revision
         self.batch_size = batch_size
         self.query_prefix = query_prefix
         self.corpus_prefix = corpus_prefix
@@ -37,7 +39,11 @@ class SentenceTransformerRetriever(BaseRetriever):
                 from sentence_transformers import SentenceTransformer
             except ImportError as exc:  # pragma: no cover - environment-specific
                 raise RuntimeError("Install `sentence-transformers` for dense retrieval.") from exc
-            self.model = SentenceTransformer(self.model_name, device=self.device)
+            self.model = SentenceTransformer(
+                self.model_name,
+                revision=self.model_revision,
+                device=self.device,
+            )
         return self.model
 
     def fit(self, items: Mapping[str, str]) -> SentenceTransformerRetriever:

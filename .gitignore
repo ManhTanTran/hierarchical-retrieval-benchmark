@@ -5,6 +5,9 @@ cache/*
 !cache/.gitkeep
 outputs/*
 !outputs/.gitkeep
+dapr_hhr_outputs/
+dapr_hhr_cache/
+dapr_hf_cache/
 
 __pycache__/
 *.py[cod]
@@ -26,4 +29,3 @@ venv/
 *.bin
 *.pt
 *.pth
-

@@ -27,4 +27,3 @@ class BaseRetriever(ABC):
         candidate_ids: Iterable[str] | None = None,
     ) -> list[SearchResult]:
         raise NotImplementedError
-

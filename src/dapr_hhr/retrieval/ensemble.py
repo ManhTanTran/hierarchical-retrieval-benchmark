@@ -39,4 +39,3 @@ class CombinedRetriever(BaseRetriever):
         if self.fusion != "rrf":
             raise ValueError(f"Unknown fusion method: {self.fusion}")
         return reciprocal_rank_fusion(sparse_results, dense_results, k=k, rrf_k=self.rrf_k)
-

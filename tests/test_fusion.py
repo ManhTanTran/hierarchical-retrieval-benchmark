@@ -14,4 +14,3 @@ def test_interleave_deduplicates_and_round_robins():
 def test_rrf_rewards_items_found_by_both_retrievers():
     result = reciprocal_rank_fusion(ranking("a", "b"), ranking("b", "c"), k=3, rrf_k=1)
     assert result[0].item_id == "b"
-

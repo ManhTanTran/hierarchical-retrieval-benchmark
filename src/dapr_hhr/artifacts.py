@@ -7,7 +7,7 @@ import platform
 import subprocess
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, distribution
+from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 from typing import Any
 
@@ -64,4 +64,23 @@ def collect_environment() -> dict[str, Any]:
         "platform": platform.platform(),
         "git_commit": git_commit,
         "package_source": package_source,
+        "packages": {
+            name: _package_version(name)
+            for name in (
+                "numpy",
+                "pandas",
+                "scikit-learn",
+                "datasets",
+                "huggingface-hub",
+                "sentence-transformers",
+                "torch",
+            )
+        },
     }
+
+
+def _package_version(name: str) -> str | None:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None

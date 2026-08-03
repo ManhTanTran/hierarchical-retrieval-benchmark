@@ -101,9 +101,6 @@ def evaluate_by_group(
             grouped[str(category)].append(metrics)
     output = {}
     for category, rows in grouped.items():
-        output[category] = {
-            metric: mean(row[metric] for row in rows)
-            for metric in rows[0]
-        }
+        output[category] = {metric: mean(row[metric] for row in rows) for metric in rows[0]}
         output[category]["queries"] = float(len(rows))
     return output

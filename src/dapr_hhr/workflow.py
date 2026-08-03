@@ -1,7 +1,8 @@
-"""High-level Phase 1 API used by the thin Kaggle notebook."""
+"""Dataset-agnostic high-level Phase 1 benchmark API."""
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -12,11 +13,10 @@ from typing import Any
 import pandas as pd
 
 from .artifacts import save_json, save_run_artifacts
-from .config import BenchmarkConfig
-from .data import DAPRDatasetAdapter, DatasetBundle, summarize_dataset
+from .config import BenchmarkConfig, validate_config
+from .data import DatasetBundle, summarize_dataset
 from .experiments import build_experiment_registry, run_hhr_experiment
 from .metrics import evaluate_by_group
-from .retrieval import SentenceTransformerRetriever
 from .retrieval.base import BaseRetriever
 
 
@@ -41,85 +41,72 @@ class Phase1Report:
 
 
 def _default_work_dirs() -> tuple[Path, Path]:
-    base = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path.cwd()
+    on_kaggle = os.name != "nt" and Path("/kaggle/working").is_dir()
+    base = Path("/kaggle/working") if on_kaggle else Path.cwd()
     return base / "dapr_hhr_cache", base / "dapr_hhr_outputs"
 
 
 def _build_config(
     base: BenchmarkConfig,
-    dataset_name: str,
     run_mode: str,
-    query_limit: int | None,
-    corpus_limit: int | None,
-    preserve_gold: bool,
     fusion: str,
+    dense_backend: str | None,
     dense_model: str | None,
+    dense_model_revision: str | None,
     document_top_k: int | None,
     passage_top_k: int | None,
 ) -> BenchmarkConfig:
     retrieval_overrides: dict[str, Any] = {"fusion": fusion}
-    if dense_model is not None:
-        retrieval_overrides["dense_model"] = dense_model
-    if document_top_k is not None:
-        retrieval_overrides["document_top_k"] = document_top_k
-    if passage_top_k is not None:
-        retrieval_overrides["passage_top_k"] = passage_top_k
-    return replace(
+    for key, value in (
+        ("dense_backend", dense_backend),
+        ("dense_model", dense_model),
+        ("dense_model_revision", dense_model_revision),
+        ("document_top_k", document_top_k),
+        ("passage_top_k", passage_top_k),
+    ):
+        if value is not None:
+            retrieval_overrides[key] = value
+    config = replace(
         base,
-        data=replace(
-            base.data,
-            dataset_name=dataset_name,
-            query_limit=query_limit,
-            corpus_limit=corpus_limit,
-            preserve_gold=preserve_gold,
-        ),
         retrieval=replace(base.retrieval, **retrieval_overrides),
         run=replace(base.run, mode=run_mode),
     )
+    validate_config(config)
+    return config
 
 
 def run_phase1_benchmark(
-    dataset_name: str = "ConditionalQA",
+    bundle: DatasetBundle,
     run_mode: str = "smoke",
     *,
-    query_limit: int | None = None,
-    corpus_limit: int | None = None,
-    preserve_gold: bool = True,
     fusion: str = "rrf",
+    dense_backend: str | None = None,
     dense_model: str | None = None,
+    dense_model_revision: str | None = None,
     document_top_k: int | None = None,
     passage_top_k: int | None = None,
     experiment_names: Sequence[str] | None = None,
     cache_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
     config: BenchmarkConfig | None = None,
-    bundle: DatasetBundle | None = None,
-    adapter: DAPRDatasetAdapter | None = None,
-    dense_factory: Callable[..., BaseRetriever] = SentenceTransformerRetriever,
+    query_metadata: dict[str, dict[str, Any]] | None = None,
+    dense_factory: Callable[..., BaseRetriever] | None = None,
     verbose: bool = True,
 ) -> Phase1Report:
-    """Run the complete DAPR Phase 1 workflow without notebook-owned logic.
+    """Run Phase 1 on a validated, already-normalized dataset bundle.
 
-    Smoke mode defaults to 25 queries and 5,000 ordinary passages while preserving
-    every gold passage for those queries. Full mode defaults to no sampling. Tests may
-    inject a prepared ``bundle`` to avoid network and model downloads.
+    Dataset acquisition, source-schema normalization, and sampling stay upstream
+    (for DAPR, in the Kaggle notebook). This function is reusable for any dataset
+    that can produce :class:`DatasetBundle`.
     """
-    if run_mode not in {"smoke", "full"}:
-        raise ValueError("run_mode must be 'smoke' or 'full'.")
-    if query_limit is None and run_mode == "smoke":
-        query_limit = 25
-    if corpus_limit is None and run_mode == "smoke":
-        corpus_limit = 5_000
-
+    bundle.validate()
     resolved_config = _build_config(
         config or BenchmarkConfig(),
-        dataset_name,
         run_mode,
-        query_limit,
-        corpus_limit,
-        preserve_gold,
         fusion,
+        dense_backend,
         dense_model,
+        dense_model_revision,
         document_top_k,
         passage_top_k,
     )
@@ -130,32 +117,19 @@ def run_phase1_benchmark(
     cache_path.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    data_adapter = adapter or DAPRDatasetAdapter(resolved_config.data.hf_repo)
-    if bundle is None:
-        if verbose:
-            print(f"Loading {dataset_name} ({run_mode}) from {resolved_config.data.hf_repo} ...")
-        bundle = data_adapter.load_bundle(
-            dataset_name=resolved_config.data.dataset_name,
-            split=resolved_config.data.split,
-            query_limit=resolved_config.data.query_limit,
-            corpus_limit=resolved_config.data.corpus_limit,
-            preserve_gold=resolved_config.data.preserve_gold,
-        )
     dataset_summary = summarize_dataset(bundle)
     if verbose:
         print(f"Dataset summary: {dataset_summary}")
     if dataset_summary["queries_with_relevant_passages"] == 0:
-        raise ValueError("The selected sample contains no positive qrels.")
+        raise ValueError("The selected dataset contains no positive qrels.")
 
     registry = build_experiment_registry()
-    selected_names = list(
-        experiment_names
-        or (
-            resolved_config.run.smoke_experiments
-            if run_mode == "smoke"
-            else tuple(registry)
-        )
-    )
+    defaults = {
+        "smoke": resolved_config.run.smoke_experiments,
+        "baseline": resolved_config.run.baseline_experiments,
+        "full": tuple(registry),
+    }
+    selected_names = list(experiment_names or defaults[run_mode])
     unknown = sorted(set(selected_names) - set(registry))
     if unknown:
         raise ValueError(f"Unknown experiment names: {unknown}")
@@ -201,15 +175,12 @@ def run_phase1_benchmark(
     )
     leaderboard.to_csv(artifact_root / "leaderboard.csv", index=False)
 
+    metadata = query_metadata if query_metadata is not None else bundle.query_metadata
     grouped_metrics: dict[str, dict[str, float]] = {}
-    if dataset_name == "NaturalQuestions":
-        query_metadata = data_adapter.load_query_metadata(dataset_name)
+    if metadata:
         best_name = str(leaderboard.iloc[0]["experiment"])
-        grouped_metrics = evaluate_by_group(
-            experiment_results[best_name]["per_query"],
-            query_metadata,
-        )
-        save_json(artifact_root / "nq_hard_grouped_metrics.json", grouped_metrics)
+        grouped_metrics = evaluate_by_group(experiment_results[best_name]["per_query"], metadata)
+        save_json(artifact_root / "grouped_metrics.json", grouped_metrics)
 
     archive_path = Path(
         shutil.make_archive(

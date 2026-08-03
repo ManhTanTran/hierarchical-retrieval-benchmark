@@ -6,4 +6,3 @@ def test_registry_contains_all_nine_hhr_combinations():
     assert len(registry) == 9
     assert "sparse__sparse" in registry
     assert "combined__combined" in registry
-

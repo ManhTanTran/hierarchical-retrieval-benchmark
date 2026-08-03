@@ -6,12 +6,11 @@ from dapr_hhr.workflow import run_phase1_benchmark
 
 def test_high_level_workflow_runs_without_notebook_logic(tmp_path):
     report = run_phase1_benchmark(
-        dataset_name="ConditionalQA",
+        make_synthetic_bundle(),
         run_mode="smoke",
         experiment_names=["sparse__sparse"],
         cache_dir=tmp_path / "cache",
         output_dir=tmp_path / "outputs",
-        bundle=make_synthetic_bundle(),
         document_top_k=2,
         passage_top_k=3,
         verbose=False,

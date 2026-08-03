@@ -17,4 +17,3 @@ def test_sparse_hierarchy_runs_end_to_end():
     assert set(runs) == {"q1", "q2"}
     assert metrics["passage_recall@3"] == 1.0
     assert set(per_query) == {"q1", "q2"}
-

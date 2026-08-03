@@ -11,4 +11,3 @@ def test_metrics_are_one_for_perfect_ranking():
 
 def test_recall_handles_no_relevant_items():
     assert compute_recall_at_k(["p1"], {}, 10) == 0.0
-
