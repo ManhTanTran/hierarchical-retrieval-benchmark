@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,11 +31,38 @@ from .retrieval.base import SearchResult
 Level = Literal["document", "passage"]
 _SQLITE_BATCH_SIZE = 10_000
 _SQLITE_PARAMETER_CHUNK = 800
+_CACHE_FORMAT_VERSION = 2
 
 
 def _chunks(values: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _fingerprint(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 class DiskDatasetStore:
@@ -115,6 +144,8 @@ class DiskDatasetStore:
                 "name": name,
                 "provenance": json.dumps(provenance or {}, sort_keys=True),
                 "finalized": "0",
+                "document_fts_ready": "0",
+                "passage_fts_ready": "0",
             }
             connection.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", values.items())
             connection.commit()
@@ -237,11 +268,18 @@ class DiskDatasetStore:
                 ),
             )
 
-    def finalize(self) -> None:
+    def finalize(self, *, build_passage_fts: bool = False) -> None:
         self._require_mutable()
         with self._connect() as connection:
             connection.execute("INSERT INTO documents_fts(documents_fts) VALUES ('rebuild')")
-            connection.execute("INSERT INTO passages_fts(passages_fts) VALUES ('rebuild')")
+            connection.execute(
+                "UPDATE metadata SET value = '1' WHERE key = 'document_fts_ready'"
+            )
+            if build_passage_fts:
+                connection.execute("INSERT INTO passages_fts(passages_fts) VALUES ('rebuild')")
+                connection.execute(
+                    "UPDATE metadata SET value = '1' WHERE key = 'passage_fts_ready'"
+                )
             connection.execute("UPDATE metadata SET value = '1' WHERE key = 'finalized'")
             connection.execute("ANALYZE")
         self.validate()
@@ -270,6 +308,25 @@ class DiskDatasetStore:
                 yield int(row["rowid"]) - 1, str(row["item_id"]), str(row["search_text"])
         finally:
             connection.close()
+
+    def items_for_ids(self, level: Level, item_ids: Iterable[str]) -> list[tuple[str, str]]:
+        """Return selected item IDs and search text in stable corpus order."""
+        table = self._table(level)
+        values = list(dict.fromkeys(map(str, item_ids)))
+        rows: list[tuple[int, str, str]] = []
+        with self._connect() as connection:
+            for chunk in _chunks(values, _SQLITE_PARAMETER_CHUNK):
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    (int(row["rowid"]), str(row["item_id"]), str(row["search_text"]))
+                    for row in connection.execute(
+                        f"SELECT rowid, item_id, search_text FROM {table} "
+                        f"WHERE item_id IN ({placeholders})",
+                        tuple(chunk),
+                    )
+                )
+        rows.sort(key=lambda row: row[0])
+        return [(item_id, text) for _, item_id, text in rows]
 
     def queries(self) -> list[Query]:
         with self._connect() as connection:
@@ -360,6 +417,16 @@ class DiskDatasetStore:
     ) -> list[SearchResult]:
         if k <= 0:
             return []
+        ready_key = f"{level}_fts_ready"
+        metadata = self._metadata()
+        ready = metadata.get(ready_key)
+        if ready is None and metadata.get("finalized") == "1":
+            ready = "1"  # Legacy stores built both FTS indexes during finalize().
+        if ready != "1":
+            raise RuntimeError(
+                f"The global {level} FTS5 index is not available. "
+                "Use a candidate sparse index for passage retrieval."
+            )
         table = self._table(level)
         fts_table = f"{table}_fts"
         match_query = self._fts_query(query)
@@ -452,46 +519,50 @@ class DiskDatasetStore:
         }
 
 
-class MemmapDenseIndex:
-    """Batched encoder with exact cosine search over a memory-mapped matrix."""
+class DenseEncoderRuntime:
+    """One reusable Sentence Transformers runtime and optional persistent GPU pool."""
 
     def __init__(
         self,
-        store: DiskDatasetStore,
-        level: Level,
-        index_dir: str | Path,
         *,
         model_name: str = "intfloat/e5-small-v2",
         model_revision: str | None = None,
         encoder: Any | None = None,
+        enable_multi_gpu: bool = True,
+        preferred_devices: Sequence[str] = ("cuda:0", "cuda:1"),
+        available_devices: Sequence[str] | None = None,
         batch_size: int = 64,
-        search_chunk_size: int = 50_000,
-        query_prefix: str = "query: ",
-        corpus_prefix: str = "passage: ",
+        multi_process_chunk_size: int = 5_000,
+        verbose: bool = True,
     ) -> None:
-        self.store = store
-        self.level = level
-        self.index_dir = Path(index_dir)
         self.model_name = model_name
         self.model_revision = model_revision
         self.encoder = encoder
+        self.enable_multi_gpu = enable_multi_gpu
+        self.preferred_devices = tuple(preferred_devices)
+        self._available_devices = (
+            tuple(available_devices) if available_devices is not None else None
+        )
         self.batch_size = batch_size
-        self.search_chunk_size = search_chunk_size
-        self.query_prefix = query_prefix
-        self.corpus_prefix = corpus_prefix
-        self.embedding_path = self.index_dir / f"{level}_embeddings.npy"
-        self.metadata_path = self.index_dir / f"{level}_embeddings.json"
-        self._embeddings: np.ndarray | None = None
-
-    def _get_encoder(self):
-        if self.encoder is None:
-            from sentence_transformers import SentenceTransformer
-
-            self.encoder = SentenceTransformer(self.model_name, revision=self.model_revision)
-        return self.encoder
+        self.multi_process_chunk_size = multi_process_chunk_size
+        self.verbose = verbose
+        self.pool: Any | None = None
+        self.pool_start_count = 0
+        self.devices: tuple[str, ...] = ()
+        self._entered = False
 
     @staticmethod
-    def _embedding_dimension(encoder: Any) -> int:
+    def detect_available_devices() -> tuple[str, ...]:
+        try:
+            import torch
+        except ImportError:
+            return ("cpu",)
+        if torch.cuda.is_available():
+            return tuple(f"cuda:{index}" for index in range(torch.cuda.device_count()))
+        return ("cpu",)
+
+    @staticmethod
+    def embedding_dimension(encoder: Any) -> int:
         current = getattr(encoder, "get_embedding_dimension", None)
         if callable(current):
             return int(current())
@@ -503,72 +574,335 @@ class MemmapDenseIndex:
             "get_sentence_embedding_dimension()."
         )
 
-    def _expected_metadata(self, dimensions: int) -> dict[str, Any]:
+    def __enter__(self) -> DenseEncoderRuntime:
+        if self._entered:
+            return self
+        available = self._available_devices or self.detect_available_devices()
+        selected = tuple(device for device in self.preferred_devices if device in available)
+        self.devices = selected or (available[0],)
+        if self.encoder is None:
+            from sentence_transformers import SentenceTransformer
+
+            kwargs: dict[str, Any] = {"revision": self.model_revision}
+            if len(self.devices) == 1:
+                kwargs["device"] = self.devices[0]
+            self.encoder = SentenceTransformer(self.model_name, **kwargs)
+        if (
+            self.enable_multi_gpu
+            and len(self.devices) > 1
+            and callable(getattr(self.encoder, "start_multi_process_pool", None))
+        ):
+            self.pool = self.encoder.start_multi_process_pool(target_devices=list(self.devices))
+            self.pool_start_count += 1
+        self._entered = True
+        if self.verbose:
+            print(f"Device configuration: {list(self.devices)}")
+            print(f"Multi-GPU encoding: {'enabled' if self.pool is not None else 'disabled'}")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del exc_type, exc_value, traceback
+        if self.pool is not None:
+            self.encoder.stop_multi_process_pool(self.pool)
+            self.pool = None
+        self._entered = False
+
+    @property
+    def dimension(self) -> int:
+        if not self._entered:
+            self.__enter__()
+        return self.embedding_dimension(self.encoder)
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        if not self._entered:
+            self.__enter__()
+        kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "normalize_embeddings": True,
+            "show_progress_bar": False,
+            "convert_to_numpy": True,
+        }
+        if self.pool is not None:
+            kwargs["pool"] = self.pool
+            kwargs["chunk_size"] = self.multi_process_chunk_size
+        return np.asarray(self.encoder.encode(list(texts), **kwargs), dtype=np.float32)
+
+
+class MemmapDenseIndex:
+    """Resumable exact cosine index over a full corpus or a selected candidate set."""
+
+    def __init__(
+        self,
+        store: DiskDatasetStore,
+        level: Level,
+        index_dir: str | Path,
+        *,
+        model_name: str = "intfloat/e5-small-v2",
+        model_revision: str | None = None,
+        encoder: Any | None = None,
+        runtime: DenseEncoderRuntime | None = None,
+        batch_size: int = 64,
+        search_chunk_size: int = 50_000,
+        query_prefix: str = "query: ",
+        corpus_prefix: str = "passage: ",
+        selected_ids: Sequence[str] | None = None,
+        cache_name: str | None = None,
+        cache_context: dict[str, Any] | None = None,
+        embedding_write_chunk_size: int = 50_000,
+        checkpoint_rows: int = 50_000,
+        enable_resume: bool = True,
+        dtype: str = "float32",
+        progress_interval: int = 50_000,
+        verbose: bool = False,
+    ) -> None:
+        self.store = store
+        self.level = level
+        self.index_dir = Path(index_dir)
+        self.model_name = model_name
+        self.model_revision = model_revision
+        self.encoder = encoder
+        self.runtime = runtime
+        self.batch_size = batch_size
+        self.search_chunk_size = search_chunk_size
+        self.query_prefix = query_prefix
+        self.corpus_prefix = corpus_prefix
+        self.selected_ids = (
+            tuple(dict.fromkeys(map(str, selected_ids))) if selected_ids is not None else None
+        )
+        self.cache_name = cache_name or level
+        self.cache_context = dict(cache_context or {})
+        self.embedding_write_chunk_size = embedding_write_chunk_size
+        self.checkpoint_rows = checkpoint_rows
+        self.enable_resume = enable_resume
+        self.dtype = dtype
+        self.progress_interval = progress_interval
+        self.verbose = verbose
+        self.embedding_path = self.index_dir / f"{self.cache_name}_embeddings.npy"
+        self.metadata_path = self.index_dir / f"{self.cache_name}_embeddings.json"
+        self.progress_path = self.index_dir / f"{self.cache_name}_embeddings.progress.json"
+        self.ids_path = self.index_dir / f"{self.cache_name}_item_ids.txt"
+        self._embeddings: np.ndarray | None = None
+        self._item_ids: tuple[str, ...] | None = None
+        self._id_to_index: dict[str, int] | None = None
+        self.build_status = "not_built"
+
+    def _get_runtime(self) -> DenseEncoderRuntime:
+        if self.runtime is None:
+            self.runtime = DenseEncoderRuntime(
+                model_name=self.model_name,
+                model_revision=self.model_revision,
+                encoder=self.encoder,
+                enable_multi_gpu=False,
+                batch_size=self.batch_size,
+                verbose=False,
+            )
+        self.runtime.__enter__()
+        return self.runtime
+
+    @staticmethod
+    def _embedding_dimension(encoder: Any) -> int:
+        return DenseEncoderRuntime.embedding_dimension(encoder)
+
+    def _items(self) -> list[tuple[str, str]] | None:
+        if self.selected_ids is None:
+            return None
+        items = self.store.items_for_ids(self.level, self.selected_ids)
+        if len(items) != len(self.selected_ids):
+            found = {item_id for item_id, _ in items}
+            missing = sorted(set(self.selected_ids) - found)
+            raise ValueError(f"Candidate index references missing {self.level} IDs: {missing[:5]}")
+        return items
+
+    def _expected_metadata(
+        self, dimensions: int, count: int, item_ids_fingerprint: str
+    ) -> dict[str, Any]:
+        provenance = self.store.provenance
+        corpus_identity = provenance.get("corpus_key") or self.store.dataset_id
         return {
-            "dataset_id": self.store.dataset_id,
+            "cache_format_version": _CACHE_FORMAT_VERSION,
+            "corpus_identity": corpus_identity,
+            "dataset_provenance": provenance,
             "level": self.level,
-            "count": self.store.item_count(self.level),
+            "count": count,
+            "item_ids_fingerprint": item_ids_fingerprint,
             "dimensions": dimensions,
             "model_name": self.model_name,
             "model_revision": self.model_revision,
             "query_prefix": self.query_prefix,
             "corpus_prefix": self.corpus_prefix,
-            "dtype": "float32",
+            "text_strategy": "title_body" if self.level == "document" else "title_text",
+            "normalize_embeddings": True,
+            "dtype": self.dtype,
+            "cache_context": self.cache_context,
         }
 
+    @staticmethod
+    def _metadata_matches(current: dict[str, Any], expected: dict[str, Any]) -> bool:
+        return all(current.get(key) == value for key, value in expected.items())
+
+    def _load_item_ids(self) -> tuple[str, ...]:
+        return tuple(self.ids_path.read_text(encoding="utf-8").splitlines())
+
     def build(self) -> MemmapDenseIndex:
-        encoder = self._get_encoder()
-        dimensions = self._embedding_dimension(encoder)
-        expected = self._expected_metadata(dimensions)
-        if self.metadata_path.is_file() and self.embedding_path.is_file():
+        runtime = self._get_runtime()
+        dimensions = runtime.dimension
+        selected_items = self._items()
+        if selected_items is None:
+            count = self.store.item_count(self.level)
+            item_ids_fingerprint = _fingerprint(
+                item_id for _, item_id, _ in self.store.iter_items(self.level)
+            )
+            item_ids: tuple[str, ...] | None = None
+        else:
+            item_ids = tuple(item_id for item_id, _ in selected_items)
+            count = len(selected_items)
+            item_ids_fingerprint = _fingerprint(item_ids)
+        expected = self._expected_metadata(dimensions, count, item_ids_fingerprint)
+
+        complete_files_exist = (
+            self.metadata_path.is_file()
+            and self.embedding_path.is_file()
+            and self.ids_path.is_file()
+        )
+        if complete_files_exist:
             current = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-            if current == expected:
+            if self._metadata_matches(current, expected) and current.get("state") == "complete":
                 matrix = np.load(self.embedding_path, mmap_mode="r", allow_pickle=False)
-                if matrix.shape == (expected["count"], dimensions):
+                if matrix.shape == (count, dimensions):
                     self._embeddings = matrix
+                    if self.selected_ids is not None:
+                        self._item_ids = self._load_item_ids()
+                        self._id_to_index = {
+                            item_id: index for index, item_id in enumerate(self._item_ids)
+                        }
+                    if self.verbose:
+                        print(f"Reusing complete {self.cache_name} index ({count:,} rows).")
+                    self.build_status = "reused"
                     return self
 
-        self.index_dir.mkdir(parents=True, exist_ok=True)
-        matrix = np.lib.format.open_memmap(
-            self.embedding_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(expected["count"], dimensions),
-        )
-        batch_rows: list[int] = []
-        batch_texts: list[str] = []
-
-        def write_batch() -> None:
-            if not batch_rows:
-                return
-            encoded = np.asarray(
-                encoder.encode(
-                    [self.corpus_prefix + text for text in batch_texts],
-                    batch_size=self.batch_size,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                ),
-                dtype=np.float32,
+        completed = 0
+        if self.enable_resume and self.progress_path.is_file():
+            progress = json.loads(self.progress_path.read_text(encoding="utf-8"))
+            if not self._metadata_matches(progress, expected):
+                raise ValueError(
+                    f"Incompatible partial embedding checkpoint: {self.progress_path}"
+                )
+            completed = int(progress.get("completed_count", 0))
+            if not self.embedding_path.is_file() or not self.ids_path.is_file():
+                raise ValueError("Embedding checkpoint is missing its matrix or ordered ID file.")
+            if self.verbose:
+                print(f"Resuming {self.cache_name} at row {completed:,} / {count:,}.")
+            self.build_status = "resumed"
+            matrix = np.lib.format.open_memmap(
+                self.embedding_path, mode="r+", dtype=self.dtype, shape=(count, dimensions)
             )
-            matrix[np.asarray(batch_rows, dtype=np.int64)] = encoded
-            batch_rows.clear()
-            batch_texts.clear()
+        else:
+            self.index_dir.mkdir(parents=True, exist_ok=True)
+            matrix = np.lib.format.open_memmap(
+                self.embedding_path, mode="w+", dtype=self.dtype, shape=(count, dimensions)
+            )
+            temporary_ids = self.ids_path.with_suffix(self.ids_path.suffix + ".tmp")
+            with temporary_ids.open("w", encoding="utf-8") as handle:
+                if item_ids is None:
+                    for _, item_id, _ in self.store.iter_items(self.level):
+                        handle.write(item_id + "\n")
+                else:
+                    for item_id in item_ids:
+                        handle.write(item_id + "\n")
+            temporary_ids.replace(self.ids_path)
+            _atomic_write_json(
+                self.progress_path,
+                {**expected, "state": "partial", "completed_count": 0},
+            )
+            if self.verbose:
+                print(f"Creating {self.cache_name} index ({count:,} rows).")
+            self.build_status = "created"
 
-        for row_index, _, text in self.store.iter_items(self.level):
-            batch_rows.append(row_index)
-            batch_texts.append(text)
-            if len(batch_rows) >= self.batch_size:
-                write_batch()
-        write_batch()
+        chunk_size = min(self.embedding_write_chunk_size, self.checkpoint_rows)
+        started = perf_counter()
+        initial_completed = completed
+        last_progress = completed
+        if selected_items is None:
+            source = (
+                (item_id, text)
+                for row_index, item_id, text in self.store.iter_items(self.level)
+                if row_index >= completed
+            )
+        else:
+            source = iter(selected_items[completed:])
+        pending: list[tuple[str, str]] = []
+        for item in source:
+            pending.append(item)
+            if len(pending) < chunk_size:
+                continue
+            completed = self._write_chunk(matrix, completed, pending, runtime)
+            _atomic_write_json(
+                self.progress_path,
+                {**expected, "state": "partial", "completed_count": completed},
+            )
+            if self.verbose and completed - last_progress >= self.progress_interval:
+                self._print_progress(
+                    completed, count, started, runtime.devices, initial_completed
+                )
+                last_progress = completed
+            pending.clear()
+        if pending:
+            completed = self._write_chunk(matrix, completed, pending, runtime)
+            _atomic_write_json(
+                self.progress_path,
+                {**expected, "state": "partial", "completed_count": completed},
+            )
         matrix.flush()
-        temporary_metadata = self.metadata_path.with_suffix(".json.tmp")
-        temporary_metadata.write_text(
-            json.dumps(expected, indent=2, sort_keys=True), encoding="utf-8"
+        if completed != count:
+            raise RuntimeError(f"Encoded {completed:,} rows but expected {count:,}.")
+        _atomic_write_json(
+            self.metadata_path,
+            {**expected, "state": "complete", "completed_count": completed},
         )
-        temporary_metadata.replace(self.metadata_path)
+        self.progress_path.unlink(missing_ok=True)
         self._embeddings = np.load(self.embedding_path, mmap_mode="r", allow_pickle=False)
+        if item_ids is not None:
+            self._item_ids = item_ids
+            self._id_to_index = {item_id: index for index, item_id in enumerate(item_ids)}
+        if self.verbose:
+            self._print_progress(completed, count, started, runtime.devices, initial_completed)
         return self
+
+    def _write_chunk(
+        self,
+        matrix: np.ndarray,
+        completed: int,
+        pending: Sequence[tuple[str, str]],
+        runtime: DenseEncoderRuntime,
+    ) -> int:
+        texts = [self.corpus_prefix + text for _, text in pending]
+        encoded = runtime.encode(texts).astype(self.dtype, copy=False)
+        stop = completed + len(pending)
+        if encoded.shape != (len(pending), matrix.shape[1]):
+            raise ValueError(
+                f"Encoder returned {encoded.shape}; expected {(len(pending), matrix.shape[1])}."
+            )
+        matrix[completed:stop] = encoded
+        matrix.flush()
+        return stop
+
+    def _print_progress(
+        self,
+        completed: int,
+        count: int,
+        started: float,
+        devices: Sequence[str],
+        initial_completed: int,
+    ) -> None:
+        elapsed = max(perf_counter() - started, 1e-9)
+        processed = max(completed - initial_completed, 1)
+        speed = processed / elapsed
+        eta = (count - completed) / max(speed, 1e-9)
+        print(
+            f"{self.cache_name}: {completed:,} / {count:,} | "
+            f"{speed:,.1f} rows/s | elapsed {_format_seconds(elapsed)} | "
+            f"ETA {_format_seconds(eta)} | devices {list(devices)}"
+        )
 
     def _matrix(self) -> np.ndarray:
         if self._embeddings is None:
@@ -577,13 +911,7 @@ class MemmapDenseIndex:
 
     def _encode_query(self, query: str) -> np.ndarray:
         return np.asarray(
-            self._get_encoder().encode(
-                [self.query_prefix + query],
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-            )[0],
-            dtype=np.float32,
+            self._get_runtime().encode([self.query_prefix + query])[0], dtype=np.float32
         )
 
     @staticmethod
@@ -613,8 +941,20 @@ class MemmapDenseIndex:
                 for start in range(0, len(matrix), self.search_chunk_size)
             )
         else:
-            mapping = self.store.row_indices_for_ids(self.level, candidate_ids)
-            sources = [np.asarray(list(mapping.values()), dtype=np.int64)]
+            if self._id_to_index is None:
+                selected_mapping = self.store.row_indices_for_ids(self.level, candidate_ids)
+            else:
+                selected_mapping = self._id_to_index
+            sources = [
+                np.asarray(
+                    [
+                        selected_mapping[item_id]
+                        for item_id in candidate_ids
+                        if item_id in selected_mapping
+                    ],
+                    dtype=np.int64,
+                )
+            ]
         for indices in sources:
             if not len(indices):
                 continue
@@ -625,7 +965,10 @@ class MemmapDenseIndex:
                 np.concatenate((best_scores, local_scores)),
                 k,
             )
-        id_map = self.store.ids_for_row_indices(self.level, best_indices.tolist())
+        if self._item_ids is None:
+            id_map = self.store.ids_for_row_indices(self.level, best_indices.tolist())
+        else:
+            id_map = {int(index): self._item_ids[int(index)] for index in best_indices}
         return [
             SearchResult(id_map[int(index)], float(score), rank)
             for rank, (index, score) in enumerate(zip(best_indices, best_scores, strict=True), 1)
@@ -643,12 +986,8 @@ class MemmapDenseIndex:
             return {query.query_id: [] for query in queries}
         matrix = self._matrix()
         query_vectors = np.asarray(
-            self._get_encoder().encode(
+            self._get_runtime().encode(
                 [self.query_prefix + query.text for query in queries],
-                batch_size=self.batch_size,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                convert_to_numpy=True,
             ),
             dtype=np.float32,
         )
@@ -674,7 +1013,10 @@ class MemmapDenseIndex:
                     best_indices[query_index] = merged_indices
                     best_scores[query_index] = merged_scores
         all_indices = best_indices[best_indices >= 0].tolist()
-        id_map = self.store.ids_for_row_indices(self.level, all_indices)
+        if self._item_ids is None:
+            id_map = self.store.ids_for_row_indices(self.level, all_indices)
+        else:
+            id_map = {int(index): self._item_ids[int(index)] for index in all_indices}
         return {
             query.query_id: [
                 SearchResult(id_map[int(index)], float(score), rank)
@@ -685,6 +1027,133 @@ class MemmapDenseIndex:
             ]
             for position, query in enumerate(queries)
         }
+
+
+class CandidateSparseIndex:
+    """Persistent FTS5 index containing only the union of candidate passages."""
+
+    def __init__(
+        self,
+        store: DiskDatasetStore,
+        index_dir: str | Path,
+        candidate_ids: Sequence[str],
+        *,
+        cache_name: str,
+        cache_context: dict[str, Any] | None = None,
+    ) -> None:
+        self.store = store
+        self.index_dir = Path(index_dir)
+        self.candidate_ids = tuple(dict.fromkeys(map(str, candidate_ids)))
+        self.cache_name = cache_name
+        self.cache_context = dict(cache_context or {})
+        self.database_path = self.index_dir / f"{cache_name}_sparse.sqlite"
+        self.metadata_path = self.index_dir / f"{cache_name}_sparse.json"
+        self._row_by_id: dict[str, int] = {}
+        self.build_status = "not_built"
+
+    def _expected_metadata(self) -> dict[str, Any]:
+        return {
+            "cache_format_version": _CACHE_FORMAT_VERSION,
+            "dataset_id": self.store.dataset_id,
+            "level": "passage",
+            "count": len(self.candidate_ids),
+            "item_ids_fingerprint": _fingerprint(self.candidate_ids),
+            "text_strategy": "title_text",
+            "cache_context": self.cache_context,
+        }
+
+    def build(self) -> CandidateSparseIndex:
+        expected = self._expected_metadata()
+        if self.database_path.is_file() and self.metadata_path.is_file():
+            current = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            if current == expected:
+                with sqlite3.connect(self.database_path) as connection:
+                    self._row_by_id = {
+                        str(item_id): int(rowid)
+                        for rowid, item_id in connection.execute(
+                            "SELECT rowid, item_id FROM candidate_map"
+                        )
+                    }
+                self.build_status = "reused"
+                return self
+        self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.database_path.unlink(missing_ok=True)
+        items = self.store.items_for_ids("passage", self.candidate_ids)
+        if len(items) != len(self.candidate_ids):
+            raise ValueError("Candidate sparse index references missing passage IDs.")
+        with sqlite3.connect(self.database_path) as connection:
+            connection.executescript(
+                """
+                PRAGMA journal_mode=OFF;
+                PRAGMA synchronous=OFF;
+                CREATE TABLE candidate_map (
+                    rowid INTEGER PRIMARY KEY,
+                    item_id TEXT NOT NULL UNIQUE
+                );
+                CREATE VIRTUAL TABLE candidate_fts USING fts5(
+                    item_id UNINDEXED,
+                    search_text,
+                    tokenize='unicode61'
+                );
+                """
+            )
+            rows = [(index, item_id, text) for index, (item_id, text) in enumerate(items, 1)]
+            connection.executemany(
+                "INSERT INTO candidate_map(rowid, item_id) VALUES (?, ?)",
+                ((rowid, item_id) for rowid, item_id, _ in rows),
+            )
+            connection.executemany(
+                "INSERT INTO candidate_fts(rowid, item_id, search_text) VALUES (?, ?, ?)", rows
+            )
+        self._row_by_id = {item_id: rowid for rowid, item_id, _ in rows}
+        _atomic_write_json(self.metadata_path, expected)
+        self.build_status = "created"
+        return self
+
+    def search(
+        self, query: str, k: int, candidate_ids: Iterable[str] | None = None
+    ) -> list[SearchResult]:
+        if k <= 0:
+            return []
+        match_query = self.store._fts_query(query)
+        if not match_query:
+            return []
+        if candidate_ids is None:
+            row_chunks: list[Sequence[int] | None] = [None]
+        else:
+            rows = [
+                self._row_by_id[item_id]
+                for item_id in candidate_ids
+                if item_id in self._row_by_id
+            ]
+            if not rows:
+                return []
+            row_chunks = list(_chunks(rows, _SQLITE_PARAMETER_CHUNK))
+        candidates: dict[str, float] = {}
+        with sqlite3.connect(self.database_path) as connection:
+            connection.row_factory = sqlite3.Row
+            for chunk in row_chunks:
+                where = "candidate_fts MATCH ?"
+                parameters: list[Any] = [match_query]
+                if chunk is not None:
+                    placeholders = ",".join("?" for _ in chunk)
+                    where += f" AND candidate_fts.rowid IN ({placeholders})"
+                    parameters.extend(chunk)
+                parameters.append(k)
+                for row in connection.execute(
+                    "SELECT item_id, -bm25(candidate_fts) AS score FROM candidate_fts "
+                    f"WHERE {where} ORDER BY bm25(candidate_fts), rowid LIMIT ?",
+                    tuple(parameters),
+                ):
+                    item_id = str(row["item_id"])
+                    candidates[item_id] = max(
+                        float(row["score"]), candidates.get(item_id, -np.inf)
+                    )
+        ranked = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:k]
+        return [
+            SearchResult(item_id, score, rank)
+            for rank, (item_id, score) in enumerate(ranked, 1)
+        ]
 
 
 class StoreSparseIndex:
@@ -777,12 +1246,14 @@ def run_scalable_phase1_benchmark(
     experiment_names: Sequence[str] | None = None,
     index_dir: str | Path,
     output_dir: str | Path,
+    document_checkpoint_dir: str | Path | None = None,
+    candidate_passage_cache_dir: str | Path | None = None,
     config: BenchmarkConfig | None = None,
     query_metadata: dict[str, dict[str, Any]] | None = None,
     encoder: Any | None = None,
     verbose: bool = True,
 ) -> ScalablePhase1Report:
-    """Run all selected HHR combinations using persistent, reusable indexes."""
+    """Run document-first HHR with global documents and candidate-only passages."""
     store.validate()
     resolved = _resolved_scalable_config(
         config,
@@ -811,30 +1282,110 @@ def run_scalable_phase1_benchmark(
         print(f"Disk dataset summary: {summary}")
 
     index_path = Path(index_dir)
+    document_index_path = Path(document_checkpoint_dir or index_path)
+    candidate_index_path = Path(candidate_passage_cache_dir or index_path)
     output_path = Path(output_dir)
     index_path.mkdir(parents=True, exist_ok=True)
+    document_index_path.mkdir(parents=True, exist_ok=True)
+    candidate_index_path.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
-    need_dense = any(
-        method in {"dense", "combined"}
-        for experiment in selected
-        for method in (experiment.document_method, experiment.passage_method)
-    )
-    document_dense = passage_dense = None
-    if need_dense:
-        shared = {
-            "model_name": resolved.retrieval.dense_model,
-            "model_revision": resolved.retrieval.dense_model_revision,
-            "encoder": encoder,
-            "batch_size": resolved.retrieval.dense_batch_size,
-            "query_prefix": resolved.retrieval.dense_query_prefix,
-            "corpus_prefix": resolved.retrieval.dense_corpus_prefix,
-        }
-        document_dense = MemmapDenseIndex(store, "document", index_path, **shared).build()
-        passage_dense = MemmapDenseIndex(store, "passage", index_path, **shared).build()
-    document_sparse = StoreSparseIndex(store, "document")
-    passage_sparse = StoreSparseIndex(store, "passage")
-
     required_document_methods = {experiment.document_method for experiment in selected}
+    required_passage_methods = {experiment.passage_method for experiment in selected}
+    need_document_dense = bool(required_document_methods & {"dense", "combined"})
+    need_passage_dense = bool(required_passage_methods & {"dense", "combined"})
+    need_runtime = need_document_dense or need_passage_dense
+    runtime = (
+        DenseEncoderRuntime(
+            model_name=resolved.retrieval.dense_model,
+            model_revision=resolved.retrieval.dense_model_revision,
+            encoder=encoder,
+            enable_multi_gpu=resolved.retrieval.enable_multi_gpu,
+            preferred_devices=resolved.retrieval.preferred_devices,
+            batch_size=resolved.retrieval.dense_batch_size,
+            multi_process_chunk_size=resolved.retrieval.multi_process_chunk_size,
+            verbose=verbose,
+        )
+        if need_runtime
+        else None
+    )
+    manager = runtime if runtime is not None else nullcontext(None)
+    with manager as active_runtime:
+        return _execute_scalable_benchmark(
+            store=store,
+            resolved=resolved,
+            selected=selected,
+            queries=queries,
+            qrels=qrels,
+            summary=summary,
+            document_index_path=document_index_path,
+            candidate_index_path=candidate_index_path,
+            output_path=output_path,
+            query_metadata=query_metadata,
+            runtime=active_runtime,
+            required_document_methods=required_document_methods,
+            required_passage_methods=required_passage_methods,
+            need_document_dense=need_document_dense,
+            need_passage_dense=need_passage_dense,
+            verbose=verbose,
+        )
+
+
+def _execute_scalable_benchmark(
+    *,
+    store: DiskDatasetStore,
+    resolved: BenchmarkConfig,
+    selected: Sequence[Any],
+    queries: Sequence[Query],
+    qrels: Sequence[Qrel],
+    summary: dict[str, Any],
+    document_index_path: Path,
+    candidate_index_path: Path,
+    output_path: Path,
+    query_metadata: dict[str, dict[str, Any]] | None,
+    runtime: DenseEncoderRuntime | None,
+    required_document_methods: set[str],
+    required_passage_methods: set[str],
+    need_document_dense: bool,
+    need_passage_dense: bool,
+    verbose: bool,
+) -> ScalablePhase1Report:
+    """Execute one run while keeping the shared encoder pool alive."""
+    retrieval = resolved.retrieval
+    shared_dense: dict[str, Any] = {
+        "model_name": retrieval.dense_model,
+        "model_revision": retrieval.dense_model_revision,
+        "runtime": runtime,
+        "batch_size": retrieval.dense_batch_size,
+        "search_chunk_size": retrieval.dense_search_chunk_size,
+        "query_prefix": retrieval.dense_query_prefix,
+        "corpus_prefix": retrieval.dense_corpus_prefix,
+        "embedding_write_chunk_size": retrieval.embedding_write_chunk_size,
+        "checkpoint_rows": retrieval.embedding_checkpoint_rows,
+        "enable_resume": retrieval.enable_resume,
+        "dtype": retrieval.embedding_dtype,
+        "progress_interval": retrieval.progress_interval,
+        "verbose": verbose,
+    }
+    document_dense = None
+    document_preflight: dict[str, float] = {}
+    if need_document_dense:
+        if retrieval.preflight_sample_size:
+            document_preflight = _run_preflight(
+                store,
+                "document",
+                runtime,
+                retrieval.preflight_sample_size,
+                retrieval.preflight_timeout_threshold_hours,
+                retrieval.strict_preflight,
+                retrieval.dense_corpus_prefix,
+                retrieval.embedding_dtype,
+                verbose,
+            )
+        document_dense = MemmapDenseIndex(
+            store, "document", document_index_path, cache_name="document", **shared_dense
+        ).build()
+    document_sparse = StoreSparseIndex(store, "document")
+
     document_results: dict[str, dict[str, list[SearchResult]]] = {}
     document_latency: dict[str, float] = {}
     if "sparse" in required_document_methods or "combined" in required_document_methods:
@@ -864,7 +1415,7 @@ def run_scalable_phase1_benchmark(
         }
         document_latency["combined"] = document_latency["sparse"] + document_latency["dense"]
 
-    candidates = {
+    candidates: dict[str, dict[str, list[str]]] = {
         method: {
             query.query_id: store.passage_ids_for_documents(
                 result.item_id for result in document_results[method][query.query_id]
@@ -873,6 +1424,106 @@ def run_scalable_phase1_benchmark(
         }
         for method in required_document_methods
     }
+    candidate_union = sorted(
+        {
+            passage_id
+            for method_candidates in candidates.values()
+            for query_candidates in method_candidates.values()
+            for passage_id in query_candidates
+        }
+    )
+    query_fingerprint = _fingerprint(query.query_id for query in queries)
+    candidate_context = {
+        "query_ids_fingerprint": query_fingerprint,
+        "document_methods": sorted(required_document_methods),
+        "document_top_k": retrieval.document_top_k,
+        "fusion": retrieval.fusion,
+        "rrf_k": retrieval.rrf_k,
+        "passage_text_strategy": "title_text",
+    }
+    candidate_hash = _fingerprint(candidate_union)[:16]
+    candidate_name = f"candidate_passage_{candidate_hash}"
+    candidate_summary = {
+        "total_passages": summary["passages"],
+        "unique_candidate_documents": len(
+            {
+                result.item_id
+                for method_results in document_results.values()
+                for query_results in method_results.values()
+                for result in query_results
+            }
+        ),
+        "unique_candidate_passages": len(candidate_union),
+        "candidate_reduction_percent": (
+            100.0 * (1.0 - len(candidate_union) / max(1, int(summary["passages"])))
+        ),
+        "candidate_passages_by_document_method": {
+            method: len(
+                {
+                    passage_id
+                    for query_candidates in method_candidates.values()
+                    for passage_id in query_candidates
+                }
+            )
+            for method, method_candidates in candidates.items()
+        },
+        "selected_devices": list(runtime.devices) if runtime is not None else [],
+    }
+    summary = {**summary, **candidate_summary}
+    if verbose:
+        print(f"Candidate passage summary: {candidate_summary}")
+
+    passage_sparse = None
+    if required_passage_methods & {"sparse", "combined"}:
+        passage_sparse = CandidateSparseIndex(
+            store,
+            candidate_index_path,
+            candidate_union,
+            cache_name=candidate_name,
+            cache_context=candidate_context,
+        ).build()
+    passage_dense = None
+    passage_preflight: dict[str, float] = {}
+    if need_passage_dense:
+        if retrieval.preflight_sample_size:
+            passage_preflight = _run_preflight(
+                store,
+                "passage",
+                runtime,
+                retrieval.preflight_sample_size,
+                retrieval.preflight_timeout_threshold_hours,
+                retrieval.strict_preflight,
+                retrieval.dense_corpus_prefix,
+                retrieval.embedding_dtype,
+                verbose,
+                selected_ids=candidate_union,
+            )
+        passage_dense = MemmapDenseIndex(
+            store,
+            "passage",
+            candidate_index_path,
+            selected_ids=candidate_union,
+            cache_name=candidate_name,
+            cache_context=candidate_context,
+            **shared_dense,
+        ).build()
+
+    summary["embedding_estimates"] = {
+        "document": document_preflight,
+        "candidate_passage": passage_preflight,
+    }
+    summary["index_status"] = {
+        "document_dense": (
+            document_dense.build_status if document_dense is not None else "not_needed"
+        ),
+        "candidate_passage_sparse": (
+            passage_sparse.build_status if passage_sparse is not None else "not_needed"
+        ),
+        "candidate_passage_dense": (
+            passage_dense.build_status if passage_dense is not None else "not_needed"
+        ),
+    }
+
     qrels_by_query: dict[str, dict[str, float]] = {}
     for qrel in qrels:
         qrels_by_query.setdefault(qrel.query_id, {})[qrel.passage_id] = qrel.score
@@ -883,6 +1534,7 @@ def run_scalable_phase1_benchmark(
     artifact_root.mkdir(parents=True, exist_ok=False)
     save_json(artifact_root / "config.json", asdict(resolved))
     save_json(artifact_root / "dataset_summary.json", summary)
+    save_json(artifact_root / "candidate_passage_audit.json", candidate_summary)
     rows: list[dict[str, Any]] = []
     experiment_results: dict[str, dict[str, Any]] = {}
     for experiment in selected:
@@ -893,6 +1545,7 @@ def run_scalable_phase1_benchmark(
             candidate_ids = candidates[experiment.document_method][query.query_id]
             start = perf_counter()
             if experiment.passage_method == "sparse":
+                assert passage_sparse is not None
                 passage_results = passage_sparse.search(
                     query.text, resolved.retrieval.passage_top_k, candidate_ids
                 )
@@ -902,6 +1555,7 @@ def run_scalable_phase1_benchmark(
                     query.text, resolved.retrieval.passage_top_k, candidate_ids
                 )
             else:
+                assert passage_sparse is not None
                 assert passage_dense is not None
                 sparse_results = passage_sparse.search(
                     query.text, resolved.retrieval.passage_top_k, candidate_ids
@@ -952,6 +1606,7 @@ def run_scalable_phase1_benchmark(
             "experiment": result["experiment"],
             "metrics": metrics,
             "per_query": per_query,
+            "runs": runs,
             "artifact_dir": artifact_dir,
         }
 
@@ -982,3 +1637,58 @@ def run_scalable_phase1_benchmark(
         grouped_metrics,
         experiment_results,
     )
+
+
+def _run_preflight(
+    store: DiskDatasetStore,
+    level: Level,
+    runtime: DenseEncoderRuntime | None,
+    sample_size: int,
+    threshold_hours: float,
+    strict: bool,
+    corpus_prefix: str,
+    dtype: str,
+    verbose: bool,
+    *,
+    selected_ids: Sequence[str] | None = None,
+) -> dict[str, float]:
+    """Measure a small encoding sample and estimate total embedding work."""
+    if runtime is None or sample_size <= 0:
+        return {}
+    if selected_ids is None:
+        total = store.item_count(level)
+        texts: list[str] = []
+        for _, _, text in store.iter_items(level):
+            texts.append(corpus_prefix + text)
+            if len(texts) >= sample_size:
+                break
+    else:
+        items = store.items_for_ids(level, selected_ids[:sample_size])
+        total = len(selected_ids)
+        texts = [corpus_prefix + text for _, text in items]
+    if not texts:
+        return {"rows_per_second": 0.0, "estimated_hours": 0.0, "estimated_gib": 0.0}
+    started = perf_counter()
+    runtime.encode(texts)
+    elapsed = max(perf_counter() - started, 1e-9)
+    rows_per_second = len(texts) / elapsed
+    estimated_seconds = total / rows_per_second
+    bytes_per_value = np.dtype(dtype).itemsize
+    estimated_bytes = total * runtime.dimension * bytes_per_value
+    estimate = {
+        "rows_per_second": rows_per_second,
+        "estimated_hours": estimated_seconds / 3600,
+        "estimated_gib": estimated_bytes / (1024**3),
+    }
+    if verbose:
+        print(
+            f"Preflight {level}: {rows_per_second:,.1f} rows/s; "
+            f"estimated {_format_seconds(estimated_seconds)}; "
+            f"{estimate['estimated_gib']:.2f} GiB"
+        )
+    if strict and estimate["estimated_hours"] >= threshold_hours:
+        raise RuntimeError(
+            f"Preflight estimates {estimate['estimated_hours']:.2f} hours for {level}, "
+            f"which exceeds the {threshold_hours:.2f}-hour safety threshold."
+        )
+    return estimate

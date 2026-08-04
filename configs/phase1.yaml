@@ -10,6 +10,18 @@ retrieval:
   dense_model: intfloat/e5-small-v2
   dense_model_revision: ffb93f3bd4047442299a41ebb6fa998a38507c52
   dense_batch_size: 64
+  multi_process_chunk_size: 5000
+  embedding_write_chunk_size: 50000
+  embedding_checkpoint_rows: 50000
+  dense_search_chunk_size: 50000
+  preferred_devices: ["cuda:0", "cuda:1"]
+  enable_multi_gpu: true
+  enable_resume: true
+  embedding_dtype: float32
+  preflight_sample_size: 0
+  preflight_timeout_threshold_hours: 10.0
+  strict_preflight: false
+  progress_interval: 50000
   dense_query_prefix: "query: "
   dense_corpus_prefix: "passage: "
 

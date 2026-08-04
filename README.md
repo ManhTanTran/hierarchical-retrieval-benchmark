@@ -60,12 +60,18 @@ The local notebook's install cell uses this repository only for reusable Python
 code. Keep `REPO_REF="main"` while developing; use a tested commit SHA for a
 reported experiment.
 
-Real DAPR modes use the scalable path: Hugging Face rows stream into SQLite,
-FTS5 supplies the persistent sparse index, and sentence-transformer embeddings
-are generated in batches into memory-mapped `.npy` files. Indexes are built once
-per retrieval level and reused by the selected experiment matrix. Temporary
-stores and indexes belong under `/kaggle/tmp`; only final artifacts belong under
-`/kaggle/working`.
+Real DAPR modes use a document-first scalable path. Hugging Face rows stream into
+SQLite, global sparse and dense document indexes are built once, and document
+retrieval runs before any passage index is created. The backend then builds one
+candidate-only passage FTS5 index and one candidate-only dense memmap for the
+union of passages under the retrieved documents. Every query is still restricted
+to its own document-derived passage candidates.
+
+Sentence Transformers can use one persistent process pool across `cuda:0` and
+`cuda:1`. Document embeddings are checkpointed atomically and resume from the
+last completed chunk. Put disposable stores and candidate caches under
+`/kaggle/tmp`; put document checkpoints that must be exported under
+`/kaggle/working`. Factory Reset deletes `/kaggle/tmp`.
 
 ## Reusable API
 
@@ -97,6 +103,8 @@ report = run_scalable_phase1_benchmark(
     store,
     run_mode="full",
     index_dir="indexes",
+    document_checkpoint_dir="checkpoints",
+    candidate_passage_cache_dir="candidate-cache",
     output_dir="outputs",
 )
 ```
@@ -117,15 +125,16 @@ python scripts/run_scalable_smoke.py
 - Treat NQ-hard as diagnostic-only.
 - Preserve graded Genomics relevance for nDCG.
 - Report both passage and document metrics.
-- Query sampling reduces evaluation work but does not reduce corpus ingestion or
-  index construction.
+- Query sampling does not reduce global document ingestion or dense document
+  indexing, but it now reduces the candidate passage union and passage indexing.
 - The scalable dense backend uses exact cosine search over a memory-mapped
-  matrix; FTS5 provides the disk-backed sparse ranking. Results produced by the
-  old in-memory BM25 path are not directly comparable, so rerun every dataset
-  used in one comparison with the same backend.
-- Very large MIRACL and Genomics builds can still exceed Kaggle's temporary-disk
-  or session-time limits. The backend prevents full-corpus RAM materialization;
-  it does not make storage or encoding cost disappear.
+  global document matrix and candidate-only passage matrix. FTS5 provides global
+  document ranking and candidate-only passage ranking. Results produced by the
+  old global-passage or in-memory path are not directly comparable, so rerun
+  every dataset used in one comparison with the same backend.
+- MIRACL can still require multiple Kaggle sessions because dense retrieval must
+  embed all 5.76 million documents. Checkpoint/resume avoids restarting from row
+  zero, but checkpoints must be exported before a Factory Reset.
 
 No notebooks, benchmark scores, datasets, embeddings, model weights, or
 credentials are committed.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from dapr_hhr import Document, Passage, Qrel, Query
-from dapr_hhr.scalable import DiskDatasetStore
+from dapr_hhr.scalable import CandidateSparseIndex, DiskDatasetStore
 
 
 def make_store(tmp_path):
@@ -51,10 +53,18 @@ def test_disk_store_fts_search_supports_candidates(tmp_path):
     store = make_store(tmp_path)
 
     assert [row.item_id for row in store.sparse_search("document", "apple", 2)] == ["d1"]
-    assert [row.item_id for row in store.sparse_search("passage", "apple", 2)] == [
+    with pytest.raises(RuntimeError, match="global passage FTS5 index is not available"):
+        store.sparse_search("passage", "apple", 2)
+    index = CandidateSparseIndex(
+        store,
+        tmp_path / "candidate-index",
+        ["p1", "p2", "p3"],
+        cache_name="candidate_passages",
+    ).build()
+    assert [row.item_id for row in index.search("apple", 2)] == [
         "p1",
         "p2",
     ]
     assert [
-        row.item_id for row in store.sparse_search("passage", "apple", 2, candidate_ids=["p3"])
+        row.item_id for row in index.search("apple", 2, candidate_ids=["p3"])
     ] == []

@@ -111,8 +111,8 @@ def test_scalable_workflow_runs_full_matrix_and_reuses_indexes(tmp_path):
         for document in ("sparse", "dense", "combined")
         for passage in ("sparse", "dense", "combined")
     }
-    assert set((tmp_path / "indexes").glob("*_embeddings.npy")) == {
-        tmp_path / "indexes" / "document_embeddings.npy",
-        tmp_path / "indexes" / "passage_embeddings.npy",
-    }
+    embedding_files = set((tmp_path / "indexes").glob("*_embeddings.npy"))
+    assert tmp_path / "indexes" / "document_embeddings.npy" in embedding_files
+    assert tmp_path / "indexes" / "passage_embeddings.npy" not in embedding_files
+    assert any(path.name.startswith("candidate_passage_") for path in embedding_files)
     assert report.archive_path.is_file()

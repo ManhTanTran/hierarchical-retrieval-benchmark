@@ -1,6 +1,6 @@
 """Reusable components for the DAPR hierarchical-retrieval benchmark."""
 
-from .config import BenchmarkConfig, load_config, validate_config
+from .config import BenchmarkConfig, RetrievalConfig, load_config, validate_config
 from .data import (
     DatasetBundle,
     Document,
@@ -12,6 +12,8 @@ from .data import (
 )
 from .experiments import HHRExperiment, build_experiment_registry, run_hhr_experiment
 from .scalable import (
+    CandidateSparseIndex,
+    DenseEncoderRuntime,
     DiskDatasetStore,
     MemmapDenseIndex,
     ScalablePhase1Report,
@@ -21,7 +23,9 @@ from .workflow import Phase1Report, run_phase1_benchmark
 
 __all__ = [
     "BenchmarkConfig",
+    "CandidateSparseIndex",
     "DatasetBundle",
+    "DenseEncoderRuntime",
     "DiskDatasetStore",
     "Document",
     "HHRExperiment",
@@ -30,6 +34,7 @@ __all__ = [
     "Phase1Report",
     "Qrel",
     "Query",
+    "RetrievalConfig",
     "ScalablePhase1Report",
     "build_experiment_registry",
     "load_config",
