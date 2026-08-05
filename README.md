@@ -63,13 +63,15 @@ reported experiment.
 Real DAPR modes use a document-first scalable path. Hugging Face rows stream into
 SQLite, global sparse and dense document indexes are built once, and document
 retrieval runs before any passage index is created. The backend then builds one
-candidate-only passage FTS5 index and one candidate-only dense memmap for the
-union of passages under the retrieved documents. Every query is still restricted
-to its own document-derived passage candidates.
+candidate-only dense memmap for the union of passages under the retrieved
+documents. Sparse passage retrieval runs bounded BM25 directly over each query's
+own candidates, so common terms never scan a union-wide passage posting list.
 
 Sentence Transformers can use one persistent process pool across `cuda:0` and
-`cuda:1`. Document embeddings are checkpointed atomically and resume from the
-last completed chunk. Put disposable stores and candidate caches under
+`cuda:1`. Exact global dense document search uses batched PyTorch matrix search
+on CUDA when available instead of NumPy on the CPU. Document embeddings are
+checkpointed atomically and resume from the last completed chunk. Put disposable
+stores and candidate caches under
 `/kaggle/tmp`; put document checkpoints that must be exported under
 `/kaggle/working`. Factory Reset deletes `/kaggle/tmp`.
 
@@ -129,7 +131,9 @@ python scripts/run_scalable_smoke.py
   indexing, but it now reduces the candidate passage union and passage indexing.
 - The scalable dense backend uses exact cosine search over a memory-mapped
   global document matrix and candidate-only passage matrix. FTS5 provides global
-  document ranking and candidate-only passage ranking. Results produced by the
+  sparse document ranking; query-local BM25 ranks only passages beneath each
+  query's retrieved documents. Base passage results are reused across fused
+  experiments rather than recomputed. Results produced by the
   old global-passage or in-memory path are not directly comparable, so rerun
   every dataset used in one comparison with the same backend.
 - MIRACL can still require multiple Kaggle sessions because dense retrieval must

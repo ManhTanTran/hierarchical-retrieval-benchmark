@@ -6,11 +6,14 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 import uuid
+from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from math import log
 from pathlib import Path
 from statistics import mean
 from time import perf_counter
@@ -63,6 +66,56 @@ def _format_seconds(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {seconds:02d}s"
     return f"{seconds}s"
+
+
+def _sparse_tokens(text: str) -> list[str]:
+    """Approximate SQLite unicode61 tokenization without loading a global posting list."""
+    normalized = unicodedata.normalize("NFKD", text.casefold())
+    without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.findall(r"[^\W_]+", without_marks, flags=re.UNICODE)
+
+
+def _candidate_bm25(
+    items: Sequence[tuple[str, str]], query: str, k: int
+) -> list[SearchResult]:
+    """Rank a query's small candidate set with BM25 in bounded memory."""
+    query_terms = tuple(dict.fromkeys(_sparse_tokens(query)))
+    if not query_terms or not items or k <= 0:
+        return []
+    term_set = set(query_terms)
+    tokenized: list[tuple[str, Counter[str], int]] = []
+    document_frequency: Counter[str] = Counter()
+    for item_id, text in items:
+        tokens = _sparse_tokens(text)
+        frequencies = Counter(token for token in tokens if token in term_set)
+        document_frequency.update(frequencies.keys())
+        tokenized.append((item_id, frequencies, len(tokens)))
+    count = len(tokenized)
+    average_length = sum(length for _, _, length in tokenized) / max(count, 1)
+    k1 = 1.2
+    b = 0.75
+    scored: list[tuple[str, float]] = []
+    for item_id, frequencies, length in tokenized:
+        score = 0.0
+        length_factor = k1 * (1.0 - b + b * length / max(average_length, 1e-9))
+        for term in query_terms:
+            frequency = frequencies.get(term, 0)
+            if not frequency:
+                continue
+            frequency_docs = document_frequency[term]
+            inverse_frequency = log(
+                1.0 + (count - frequency_docs + 0.5) / (frequency_docs + 0.5)
+            )
+            score += inverse_frequency * frequency * (k1 + 1.0) / (
+                frequency + length_factor
+            )
+        if score > 0.0:
+            scored.append((item_id, score))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return [
+        SearchResult(item_id, score, rank)
+        for rank, (item_id, score) in enumerate(scored[:k], 1)
+    ]
 
 
 class DiskDatasetStore:
@@ -685,6 +738,7 @@ class MemmapDenseIndex:
         self._item_ids: tuple[str, ...] | None = None
         self._id_to_index: dict[str, int] | None = None
         self.build_status = "not_built"
+        self.search_backend = "numpy_cpu"
 
     def _get_runtime(self) -> DenseEncoderRuntime:
         if self.runtime is None:
@@ -914,6 +968,18 @@ class MemmapDenseIndex:
             self._get_runtime().encode([self.query_prefix + query])[0], dtype=np.float32
         )
 
+    def encode_queries(self, queries: Sequence[Query]) -> dict[str, np.ndarray]:
+        vectors = np.asarray(
+            self._get_runtime().encode(
+                [self.query_prefix + query.text for query in queries]
+            ),
+            dtype=np.float32,
+        )
+        return {
+            query.query_id: vectors[position]
+            for position, query in enumerate(queries)
+        }
+
     @staticmethod
     def _top_k(indices: np.ndarray, scores: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
         if not len(indices):
@@ -931,8 +997,19 @@ class MemmapDenseIndex:
     ) -> list[SearchResult]:
         if k <= 0:
             return []
+        return self.search_vector(self._encode_query(query), k, candidate_ids)
+
+    def search_vector(
+        self,
+        query_vector: np.ndarray,
+        k: int,
+        candidate_ids: Iterable[str] | None = None,
+    ) -> list[SearchResult]:
+        """Search with a pre-encoded query to avoid one GPU IPC call per query."""
+        if k <= 0:
+            return []
         matrix = self._matrix()
-        query_vector = self._encode_query(query)
+        query_vector = np.asarray(query_vector, dtype=np.float32)
         best_indices = np.empty(0, dtype=np.int64)
         best_scores = np.empty(0, dtype=np.float32)
         if candidate_ids is None:
@@ -979,7 +1056,7 @@ class MemmapDenseIndex:
         queries: Sequence[Query],
         k: int,
         *,
-        query_batch_size: int = 64,
+        query_batch_size: int = 256,
     ) -> dict[str, list[SearchResult]]:
         """Exact global search while bounding score-matrix memory."""
         if not queries or k <= 0:
@@ -992,6 +1069,12 @@ class MemmapDenseIndex:
             dtype=np.float32,
         )
         selected_k = min(k, len(matrix))
+        accelerated = self._search_many_torch(
+            matrix, query_vectors, selected_k, query_batch_size
+        )
+        if accelerated is not None:
+            best_indices, best_scores = accelerated
+            return self._format_many_results(queries, best_indices, best_scores)
         best_indices = np.full((len(queries), selected_k), -1, dtype=np.int64)
         best_scores = np.full((len(queries), selected_k), -np.inf, dtype=np.float32)
         for corpus_start in range(0, len(matrix), self.search_chunk_size):
@@ -1012,6 +1095,81 @@ class MemmapDenseIndex:
                     )
                     best_indices[query_index] = merged_indices
                     best_scores[query_index] = merged_scores
+        self.search_backend = "numpy_cpu"
+        return self._format_many_results(queries, best_indices, best_scores)
+
+    def _search_many_torch(
+        self,
+        matrix: np.ndarray,
+        query_vectors: np.ndarray,
+        selected_k: int,
+        query_batch_size: int,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Use one CUDA device for exact batched search when PyTorch CUDA is available."""
+        try:
+            import torch
+        except ImportError:
+            return None
+        if not torch.cuda.is_available():
+            return None
+        runtime_devices = self._get_runtime().devices
+        device_name = next(
+            (device for device in runtime_devices if device.startswith("cuda")), "cuda:0"
+        )
+        device = torch.device(device_name)
+        if self.verbose:
+            print(f"Dense global search: exact batched matrix search on {device_name}.")
+        query_tensor = torch.as_tensor(query_vectors, dtype=torch.float32, device=device)
+        best_scores = torch.full(
+            (len(query_vectors), selected_k),
+            -torch.inf,
+            dtype=torch.float32,
+            device=device,
+        )
+        best_indices = torch.full(
+            (len(query_vectors), selected_k),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        with torch.inference_mode():
+            for corpus_start in range(0, len(matrix), self.search_chunk_size):
+                corpus_stop = min(corpus_start + self.search_chunk_size, len(matrix))
+                corpus = torch.as_tensor(
+                    np.asarray(matrix[corpus_start:corpus_stop], dtype=np.float32),
+                    device=device,
+                )
+                local_k = min(selected_k, len(corpus))
+                for query_start in range(0, len(query_vectors), query_batch_size):
+                    query_stop = min(query_start + query_batch_size, len(query_vectors))
+                    scores = corpus @ query_tensor[query_start:query_stop].T
+                    local_scores, local_indices = torch.topk(
+                        scores, local_k, dim=0, largest=True, sorted=True
+                    )
+                    local_scores = local_scores.T
+                    local_indices = local_indices.T + corpus_start
+                    merged_scores = torch.cat(
+                        (best_scores[query_start:query_stop], local_scores), dim=1
+                    )
+                    merged_indices = torch.cat(
+                        (best_indices[query_start:query_stop], local_indices), dim=1
+                    )
+                    top_scores, top_positions = torch.topk(
+                        merged_scores, selected_k, dim=1, largest=True, sorted=True
+                    )
+                    best_scores[query_start:query_stop] = top_scores
+                    best_indices[query_start:query_stop] = torch.gather(
+                        merged_indices, 1, top_positions
+                    )
+        self.search_backend = f"torch_{device_name}"
+        return best_indices.cpu().numpy(), best_scores.cpu().numpy()
+
+    def _format_many_results(
+        self,
+        queries: Sequence[Query],
+        best_indices: np.ndarray,
+        best_scores: np.ndarray,
+    ) -> dict[str, list[SearchResult]]:
         all_indices = best_indices[best_indices >= 0].tolist()
         if self._item_ids is None:
             id_map = self.store.ids_for_row_indices(self.level, all_indices)
@@ -1030,7 +1188,7 @@ class MemmapDenseIndex:
 
 
 class CandidateSparseIndex:
-    """Persistent FTS5 index containing only the union of candidate passages."""
+    """Bounded BM25 reranker over each query's candidate passages."""
 
     def __init__(
         self,
@@ -1048,7 +1206,6 @@ class CandidateSparseIndex:
         self.cache_context = dict(cache_context or {})
         self.database_path = self.index_dir / f"{cache_name}_sparse.sqlite"
         self.metadata_path = self.index_dir / f"{cache_name}_sparse.json"
-        self._row_by_id: dict[str, int] = {}
         self.build_status = "not_built"
 
     def _expected_metadata(self) -> dict[str, Any]:
@@ -1059,53 +1216,22 @@ class CandidateSparseIndex:
             "count": len(self.candidate_ids),
             "item_ids_fingerprint": _fingerprint(self.candidate_ids),
             "text_strategy": "title_text",
+            "backend": "query_candidate_bm25",
+            "ranking_scope": "per_query_candidate_set",
             "cache_context": self.cache_context,
         }
 
     def build(self) -> CandidateSparseIndex:
         expected = self._expected_metadata()
-        if self.database_path.is_file() and self.metadata_path.is_file():
+        if not self.database_path.exists() and self.metadata_path.is_file():
             current = json.loads(self.metadata_path.read_text(encoding="utf-8"))
             if current == expected:
-                with sqlite3.connect(self.database_path) as connection:
-                    self._row_by_id = {
-                        str(item_id): int(rowid)
-                        for rowid, item_id in connection.execute(
-                            "SELECT rowid, item_id FROM candidate_map"
-                        )
-                    }
                 self.build_status = "reused"
                 return self
         self.index_dir.mkdir(parents=True, exist_ok=True)
+        # Remove the obsolete union-wide FTS database. It made common terms scan
+        # postings across millions of passages before applying a tiny candidate filter.
         self.database_path.unlink(missing_ok=True)
-        items = self.store.items_for_ids("passage", self.candidate_ids)
-        if len(items) != len(self.candidate_ids):
-            raise ValueError("Candidate sparse index references missing passage IDs.")
-        with sqlite3.connect(self.database_path) as connection:
-            connection.executescript(
-                """
-                PRAGMA journal_mode=OFF;
-                PRAGMA synchronous=OFF;
-                CREATE TABLE candidate_map (
-                    rowid INTEGER PRIMARY KEY,
-                    item_id TEXT NOT NULL UNIQUE
-                );
-                CREATE VIRTUAL TABLE candidate_fts USING fts5(
-                    item_id UNINDEXED,
-                    search_text,
-                    tokenize='unicode61'
-                );
-                """
-            )
-            rows = [(index, item_id, text) for index, (item_id, text) in enumerate(items, 1)]
-            connection.executemany(
-                "INSERT INTO candidate_map(rowid, item_id) VALUES (?, ?)",
-                ((rowid, item_id) for rowid, item_id, _ in rows),
-            )
-            connection.executemany(
-                "INSERT INTO candidate_fts(rowid, item_id, search_text) VALUES (?, ?, ?)", rows
-            )
-        self._row_by_id = {item_id: rowid for rowid, item_id, _ in rows}
         _atomic_write_json(self.metadata_path, expected)
         self.build_status = "created"
         return self
@@ -1115,45 +1241,8 @@ class CandidateSparseIndex:
     ) -> list[SearchResult]:
         if k <= 0:
             return []
-        match_query = self.store._fts_query(query)
-        if not match_query:
-            return []
-        if candidate_ids is None:
-            row_chunks: list[Sequence[int] | None] = [None]
-        else:
-            rows = [
-                self._row_by_id[item_id]
-                for item_id in candidate_ids
-                if item_id in self._row_by_id
-            ]
-            if not rows:
-                return []
-            row_chunks = list(_chunks(rows, _SQLITE_PARAMETER_CHUNK))
-        candidates: dict[str, float] = {}
-        with sqlite3.connect(self.database_path) as connection:
-            connection.row_factory = sqlite3.Row
-            for chunk in row_chunks:
-                where = "candidate_fts MATCH ?"
-                parameters: list[Any] = [match_query]
-                if chunk is not None:
-                    placeholders = ",".join("?" for _ in chunk)
-                    where += f" AND candidate_fts.rowid IN ({placeholders})"
-                    parameters.extend(chunk)
-                parameters.append(k)
-                for row in connection.execute(
-                    "SELECT item_id, -bm25(candidate_fts) AS score FROM candidate_fts "
-                    f"WHERE {where} ORDER BY bm25(candidate_fts), rowid LIMIT ?",
-                    tuple(parameters),
-                ):
-                    item_id = str(row["item_id"])
-                    candidates[item_id] = max(
-                        float(row["score"]), candidates.get(item_id, -np.inf)
-                    )
-        ranked = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:k]
-        return [
-            SearchResult(item_id, score, rank)
-            for rank, (item_id, score) in enumerate(ranked, 1)
-        ]
+        selected = self.candidate_ids if candidate_ids is None else tuple(candidate_ids)
+        return _candidate_bm25(self.store.items_for_ids("passage", selected), query, k)
 
 
 class StoreSparseIndex:
@@ -1395,6 +1484,11 @@ def _execute_scalable_benchmark(
             for query in queries
         }
         document_latency["sparse"] = (perf_counter() - start) * 1000 / max(1, len(queries))
+        if verbose:
+            print(
+                "Sparse document retrieval completed in "
+                f"{_format_seconds(perf_counter() - start)}."
+            )
     if "dense" in required_document_methods or "combined" in required_document_methods:
         assert document_dense is not None
         start = perf_counter()
@@ -1402,6 +1496,11 @@ def _execute_scalable_benchmark(
             queries, resolved.retrieval.document_top_k
         )
         document_latency["dense"] = (perf_counter() - start) * 1000 / max(1, len(queries))
+        if verbose:
+            print(
+                f"Dense document retrieval ({document_dense.search_backend}) completed in "
+                f"{_format_seconds(perf_counter() - start)}."
+            )
     if "combined" in required_document_methods:
         document_results["combined"] = {
             query.query_id: _fuse(
@@ -1468,6 +1567,10 @@ def _execute_scalable_benchmark(
             for method, method_candidates in candidates.items()
         },
         "selected_devices": list(runtime.devices) if runtime is not None else [],
+        "document_dense_search_backend": (
+            document_dense.search_backend if document_dense is not None else "not_needed"
+        ),
+        "passage_sparse_scope": "per_query_candidate_set",
     }
     summary = {**summary, **candidate_summary}
     if verbose:
@@ -1529,6 +1632,63 @@ def _execute_scalable_benchmark(
         qrels_by_query.setdefault(qrel.query_id, {})[qrel.passage_id] = qrel.score
     passage_to_doc = store.passage_to_document(qrel.passage_id for qrel in qrels)
 
+    base_passage_methods: set[str] = set()
+    if required_passage_methods & {"sparse", "combined"}:
+        base_passage_methods.add("sparse")
+    if required_passage_methods & {"dense", "combined"}:
+        base_passage_methods.add("dense")
+    dense_query_vectors: dict[str, np.ndarray] = {}
+    dense_query_encoding_ms = 0.0
+    if "dense" in base_passage_methods:
+        assert passage_dense is not None
+        started = perf_counter()
+        dense_query_vectors = passage_dense.encode_queries(queries)
+        dense_query_encoding_ms = (perf_counter() - started) * 1000 / max(1, len(queries))
+
+    passage_result_cache: dict[
+        tuple[str, str], dict[str, list[SearchResult]]
+    ] = {}
+    passage_latency_cache: dict[tuple[str, str], dict[str, float]] = {}
+    for document_method in sorted(required_document_methods):
+        for passage_method in sorted(base_passage_methods):
+            cache_key = (document_method, passage_method)
+            method_results: dict[str, list[SearchResult]] = {}
+            method_latencies: dict[str, float] = {}
+            started = perf_counter()
+            for position, query in enumerate(queries, 1):
+                candidate_ids = candidates[document_method][query.query_id]
+                query_started = perf_counter()
+                if passage_method == "sparse":
+                    assert passage_sparse is not None
+                    result = passage_sparse.search(
+                        query.text, retrieval.passage_top_k, candidate_ids
+                    )
+                    encoding_latency = 0.0
+                else:
+                    assert passage_dense is not None
+                    result = passage_dense.search_vector(
+                        dense_query_vectors[query.query_id],
+                        retrieval.passage_top_k,
+                        candidate_ids,
+                    )
+                    encoding_latency = dense_query_encoding_ms
+                method_results[query.query_id] = result
+                method_latencies[query.query_id] = (
+                    (perf_counter() - query_started) * 1000 + encoding_latency
+                )
+                if verbose and position % 250 == 0:
+                    print(
+                        f"Passage {document_method}__{passage_method}: "
+                        f"{position:,} / {len(queries):,} queries"
+                    )
+            passage_result_cache[cache_key] = method_results
+            passage_latency_cache[cache_key] = method_latencies
+            if verbose:
+                print(
+                    f"Passage {document_method}__{passage_method} completed in "
+                    f"{_format_seconds(perf_counter() - started)}."
+                )
+
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     artifact_root = output_path / run_id
     artifact_root.mkdir(parents=True, exist_ok=False)
@@ -1542,27 +1702,19 @@ def _execute_scalable_benchmark(
             print(f"Running scalable {experiment.name} ...")
         runs: dict[str, QueryRun] = {}
         for query in queries:
-            candidate_ids = candidates[experiment.document_method][query.query_id]
-            start = perf_counter()
             if experiment.passage_method == "sparse":
-                assert passage_sparse is not None
-                passage_results = passage_sparse.search(
-                    query.text, resolved.retrieval.passage_top_k, candidate_ids
-                )
+                cache_key = (experiment.document_method, "sparse")
+                passage_results = passage_result_cache[cache_key][query.query_id]
+                passage_latency = passage_latency_cache[cache_key][query.query_id]
             elif experiment.passage_method == "dense":
-                assert passage_dense is not None
-                passage_results = passage_dense.search(
-                    query.text, resolved.retrieval.passage_top_k, candidate_ids
-                )
+                cache_key = (experiment.document_method, "dense")
+                passage_results = passage_result_cache[cache_key][query.query_id]
+                passage_latency = passage_latency_cache[cache_key][query.query_id]
             else:
-                assert passage_sparse is not None
-                assert passage_dense is not None
-                sparse_results = passage_sparse.search(
-                    query.text, resolved.retrieval.passage_top_k, candidate_ids
-                )
-                dense_results = passage_dense.search(
-                    query.text, resolved.retrieval.passage_top_k, candidate_ids
-                )
+                sparse_key = (experiment.document_method, "sparse")
+                dense_key = (experiment.document_method, "dense")
+                sparse_results = passage_result_cache[sparse_key][query.query_id]
+                dense_results = passage_result_cache[dense_key][query.query_id]
                 passage_results = _fuse(
                     sparse_results,
                     dense_results,
@@ -1570,7 +1722,11 @@ def _execute_scalable_benchmark(
                     k=resolved.retrieval.passage_top_k,
                     rrf_k=resolved.retrieval.rrf_k,
                 )
-            latency = document_latency[experiment.document_method] + (perf_counter() - start) * 1000
+                passage_latency = (
+                    passage_latency_cache[sparse_key][query.query_id]
+                    + passage_latency_cache[dense_key][query.query_id]
+                )
+            latency = document_latency[experiment.document_method] + passage_latency
             runs[query.query_id] = QueryRun(
                 query.query_id,
                 document_results[experiment.document_method][query.query_id],
